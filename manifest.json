@@ -1,0 +1,107 @@
+{
+	"id": "bark-notify",
+	"name": "Bark 推送",
+	"nameEn": "Bark Push",
+	"version": "0.1.0",
+	"icon": "🔔",
+	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9\"/><path d=\"M13.73 21a2 2 0 0 1-3.46 0\"/></svg>",
+	"description": "任务完成 / 需要决策 / 出错时推送到 Bark；声音即优先级，浏览器在前台时自动降级为站内提示，点击推送可回到会话或一键确认。",
+	"descriptionEn": "Pushes to Bark when a run finishes, needs your decision, or dies. Sound encodes priority; suppresses to in-app toast while the browser tab is active; tapping a push returns to the conversation or acks it.",
+	"homepage": "https://github.com/onjim/bark-notify",
+	"apiVersion": 2,
+	"view": true,
+	"permissions": [
+		"net",
+		"secrets",
+		"storage",
+		"ui",
+		"http",
+		"tools",
+		"notify",
+		"chat"
+	],
+	"netAllowlist": [
+		"api.day.app",
+		"github.com",
+		"avatars.githubusercontent.com"
+	],
+	"settings": [
+		{
+			"key": "server",
+			"type": "text",
+			"label": "Bark 服务器（必填，无默认值）",
+			"labelEn": "Bark server (required, no default)",
+			"hint": "填你自己的，例 https://bark.example.com —— 只 scheme+域名，不带端口。不填 = 所有推送都不发出。"
+		},
+		{
+			"key": "barkKey",
+			"type": "secret",
+			"label": "Bark 设备密钥（必填，无默认值）",
+			"labelEn": "Bark device key (required, no default)",
+			"hint": "必填。存进 secrets，不进 git；不填则不发出任何推送。"
+		},
+		{
+			"key": "webBase",
+			"type": "text",
+			"label": "pi-web-ui 外网地址（必填，无默认值）",
+			"labelEn": "Cockpit public URL (required, no default)",
+			"hint": "必填，例 https://cockpit.example.com —— 反代域名，干方不要带端口（带端口从外网进不来）。推送的点击跳转与 /ack 都基于它；不填则推送无跳转链接。"
+		},
+		{
+			"key": "mode",
+			"type": "select",
+			"label": "推送档位",
+			"labelEn": "Notify level",
+			"default": "important",
+			"options": [
+				{ "value": "all", "label": "全推（含完成/开始）", "labelEn": "All events" },
+				{ "value": "important", "label": "只推：需决策 + 出错", "labelEn": "Only decisions + failures" },
+				{ "value": "silent", "label": "全静音（只记站内）", "labelEn": "Silent (in-app log only)" }
+			]
+		},
+		{
+			"key": "muteWhenActive",
+			"type": "number",
+			"label": "前台静音窗口（秒）",
+			"labelEn": "Mute while active (sec)",
+			"default": 120,
+			"min": 0,
+			"max": 3600,
+			"hint": "最近 N 秒内浏览器有过交互 → 不推手机，只在站内提示。0 = 关闭该判断。"
+		},
+		{
+			"key": "minRunMs",
+			"type": "number",
+			"label": "最短运行时长才推「完成」",
+			"labelEn": "Only announce runs longer than (ms)",
+			"default": 20000,
+			"min": 0,
+			"max": 600000,
+			"hint": "秒回的小轮次不值得打断你。"
+		},
+		{
+			"key": "dedupSec",
+			"type": "number",
+			"label": "同内容去重窗口（秒）",
+			"labelEn": "Dedup window (sec)",
+			"default": 300,
+			"min": 0,
+			"max": 3600
+		},
+		{
+			"key": "icon",
+			"type": "text",
+			"label": "通知图标 URL（默认空）",
+			"labelEn": "Icon URL (empty by default)",
+			"hint": "默认留空 = 用 Bark App 自己的默认图标。想固定换图再填：≥150×150 PNG，否则 critical 级的附件图会被 APNs 丢。临时试图用设置页的「🖼️ 带图测试」，不会写回这里。"
+		},
+		{
+			"key": "morningCron",
+			"type": "text",
+			"label": "晨报 cron（留空关闭）",
+			"labelEn": "Morning report cron (empty = off)",
+			"default": "",
+			"hint": "例：0 8 * * * （每天 08:00）。"
+		}
+	]
+}
