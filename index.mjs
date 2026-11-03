@@ -68,13 +68,7 @@ export function classifyEvent(ev, ctx = {}) {
 	const id = shortId(ctx.convId || ev.conversationId || ev.sessionId);
 
 	switch (ev.type) {
-		case "run_start":
-			return {
-				kind: "start",
-				title: clip(`⏳ ${proj} · 开始`, SHORT_TITLE),
-				body: clip(ev.task || ev.prompt || "任务已启动", SHORT_BODY),
-				sound: "silence", level: "active", archived: true, badge: 0,
-			};
+		// run_start 不生成通知：handleEvent 只记开始时间用于「最短运行时长」判断
 		case "run_end": {
 			const stop = String(ev.stopReason || "").trim().toLowerCase();
 			if (FAIL_STOP.has(stop)) {
@@ -183,7 +177,7 @@ export default definePlugin({
 				icon: clean(s.icon),
 				mode: s.mode || "important",
 				muteWhenActive: Number(s.muteWhenActive ?? 120),
-				minRunMs: Number(s.minRunMs ?? 20000),
+				minRunMs: Number(s.minRunMinutes ?? 5) * 60_000,
 				dedupSec: Number(s.dedupSec ?? 300),
 				morningCron: String(s.morningCron ?? "").trim(),
 			};
@@ -274,11 +268,11 @@ export default definePlugin({
 			}
 			const mode = cfg.mode;
 			if (mode === "silent" && !opts.force) { record({ ...note, result: "muted" }); return { ok: false, skipped: "mode-silent" }; }
-			if (mode === "important" && !opts.force && (note.kind === "done" || note.kind === "start")) {
+			if (mode === "important" && !opts.force && note.kind === "done") {
 				record({ ...note, result: "filtered" });
 				return { ok: false, skipped: "mode-important" };
 			}
-			if (note.kind === "done" && !opts.force && cfg.minRunMs > 0 && Number.isFinite(startedAt._lastDur) && startedAt._lastDur < cfg.minRunMs) {
+			if (note.kind === "done" && !opts.force && cfg.minRunMs > 0 && (!Number.isFinite(opts.durationMs) || opts.durationMs <= cfg.minRunMs)) {
 				return { ok: false, skipped: "too-fast" };
 			}
 			// 秒级去重
@@ -322,12 +316,12 @@ export default definePlugin({
 		async function handleEvent(ev, source = "run") {
 			if (!ev || typeof ev !== "object") return;
 			const cid = ev.conversationId || ev.sessionId || ev.clientId || "anon";
-			if (ev.type === "run_start") { startedAt.set(cid, Date.now()); }
-			const durationMs = startedAt._lastDurCache?.cid === cid ? startedAt._lastDurCache.ms : undefined;
+			if (ev.type === "run_start") { startedAt.set(cid, Date.now()); return; }
+			let durationMs;
 			if (ev.type === "run_end" || ev.type === "run_error" || ev.type === "agent_error") {
 				const t0 = startedAt.get(cid);
 				startedAt.delete(cid);
-				if (t0) { startedAt._lastDur = Date.now() - t0; startedAt._lastDurCache = { cid, ms: startedAt._lastDur }; }
+				if (t0 !== undefined) durationMs = Math.max(0, Date.now() - t0);
 			}
 			let snap = null;
 			try {
@@ -336,12 +330,12 @@ export default definePlugin({
 			const project = pickProject(snap);
 			const note = classifyEvent(ev, {
 				project,
-				durationMs: Number.isFinite(startedAt._lastDurCache?.ms) && startedAt._lastDurCache?.cid === cid ? startedAt._lastDurCache.ms : durationMs,
+				durationMs,
 				convId: shortId(cid),
 			});
 			if (!note) return;
 			note.group = note.kind === "ask" ? "pi-ask" : note.kind === "fail" ? "pi-fail" : source === "tool" ? "pi-tool" : "pi";
-			await notify(note);
+			await notify(note, { durationMs });
 		}
 
 		const offRun = host.onRunEvent((ev) => { handleEvent(ev, "run").catch((err) => host.log("error", String(err?.message || err))); });

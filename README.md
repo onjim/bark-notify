@@ -67,18 +67,18 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
 
 两条路都没走通也不会让你闷在鼓里：插件会当场点名「「bark.example.com」尚未获准出站」。
 
-可选：推送档位（全推 / 只重要 / 全静音）、前台静音窗口、最短运行时长阈值、去重窗口、图标 URL（**默认空**）、晨报 cron。
+可选：推送档位（完成+决策+出错 / 只推决策+出错 / 全静音）、前台静音窗口、最短运行时长阈值、去重窗口、图标 URL（**默认空**）、晨报 cron。所谓「全推」也不是字面全推：`turn_end`/`tool_delta` 等高频事件任何档位都不推；「完成」还受最短运行时长过滤（设 0 = 不限）。
 
 ## 事件 → 通知映射
 
 | 宿主事件 | 标题 | 声音 / 级别 | 备注 |
 |---|---|---|---|
-| `run_end`（正常 stopReason） | `✅ <项目> · 任务完成` | `glass` / active | 短于「最短运行时长」不推 |
+| `run_end`（正常 stopReason） | `✅ <项目> · 任务完成` | `glass` / active | 运行超过「最短运行时长」才推，默认 5 分钟；未捕获开始事件时不推 |
 | `run_end`（`length`/`content_filter`） | `⚠️ <项目> · 提前收尾` | `bell` / timeSensitive | 提示要续一句 |
 | `run_end`（`error`/`aborted`/`timeout`…） | `❌ <项目> · 中断` | `crow` / **critical** | 穿透静音 |
 | `tool_approval_pending` | `🙋 等批准 · <项目>` | `cicada` / timeSensitive | 点推送 = `/ack` 记一笔 |
 | `question_pending` | `🙋 需要你回答 · <项目>` | `cicada` / timeSensitive | 直达会话 |
-| `run_start` | `⏳ <项目> · 开始` | `silence` / 归档 | 只记账不弹 |
+| `run_start` | — | — | 只记录开始时间，不发送通知 |
 | `turn_end` / `tool_delta` / … | — | 不推 | 防刷屏 |
 
 ## AI 与你的用法

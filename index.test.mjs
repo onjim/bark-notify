@@ -40,7 +40,7 @@ describe("classifyEvent", () => {
 	});
 
 	it("噪声事件一律不推（防刷屏）", () => {
-		for (const type of ["turn_end", "turn_start", "tool_delta", "tool_info", "unknown_kind"]) {
+		for (const type of ["turn_end", "turn_start", "tool_delta", "tool_info", "run_start", "unknown_kind"]) {
 			assert.equal(classifyEvent({ type }, {}), null, type);
 		}
 		assert.equal(classifyEvent(null, {}), null);
@@ -71,7 +71,7 @@ describe("buildPayload", () => {
 	});
 
 	it("静默归档：archived=true 且 badge=0", () => {
-		const p = buildPayload({ barkKey: "K1" }, { kind: "start", title: "⏳", body: "", sound: "silence", archived: true, badge: 0 });
+		const p = buildPayload({ barkKey: "K1" }, { kind: "done", title: "⏳", body: "", sound: "silence", archived: true, badge: 0 });
 		assert.equal(p.archived, true);
 		assert.equal(p.badge, 0);
 	});
@@ -84,7 +84,7 @@ describe("buildPayload", () => {
 });
 
 describe("activate（mock host）", () => {
-	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", muteWhenActive: 0, minRunMs: 0, dedupSec: 0, icon: "https://x/i.png", morningCron: "" };
+	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", muteWhenActive: 0, minRunMinutes: 0, dedupSec: 0, icon: "https://x/i.png", morningCron: "" };
 
 	const requestTest = (host, headers = { "content-type": "application/json" }) => new Promise((resolve) => {
 		const route = host.mock.routes.find((r) => (r.path || r[1]) === "/test");
@@ -252,6 +252,44 @@ describe("activate（mock host）", () => {
 		await plugin.activate(host);
 		assert.equal(host.mock.calls("requestPermission").length, 0);
 	});
+
+	it("完成通知只在同一运行超过五分钟后发送，开始与未知时长不推", async (t) => {
+		let now = 1_000_000;
+		t.mock.method(Date, "now", () => now);
+		const host = createMockHost({ settings: { ...settings, minRunMinutes: 5 } });
+		host.storage.set("boot:lastPing", now);
+		const fetches = [];
+		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "short" });
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "long" });
+		await new Promise((r) => setImmediate(r));
+		assert.equal(fetches.length, 0, "开始不应发送");
+		now += 300000;
+		host.mock.emit("onRunEvent", { type: "run_end", conversationId: "short", stopReason: "end_turn" });
+		host.mock.emit("onRunEvent", { type: "run_end", conversationId: "unknown", stopReason: "end_turn" });
+		await new Promise((r) => setImmediate(r));
+		assert.equal(fetches.length, 0, "恰好五分钟和未知时长不应发送");
+		now += 1;
+		host.mock.emit("onRunEvent", { type: "run_end", conversationId: "long", stopReason: "end_turn" });
+		await new Promise((r) => setImmediate(r));
+		assert.equal(fetches.length, 1, "超过五分钟应发送一次完成通知");
+		assert.match(JSON.parse(fetches[0].init.body).title, /任务完成/);
+	});
+
+	it("短运行的错误仍立即推送", async () => {
+		const host = createMockHost({ settings: { ...settings, minRunMinutes: 5 } });
+		host.storage.set("boot:lastPing", Date.now());
+		const fetches = [];
+		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "failed" });
+		host.mock.emit("onRunEvent", { type: "run_end", conversationId: "failed", stopReason: "error" });
+		await new Promise((r) => setImmediate(r));
+		assert.equal(fetches.length, 1);
+		assert.match(JSON.parse(fetches[0].init.body).title, /中断/);
+	});
+
 	it("保存新域名立即申请授权；修改密钥不重新申请", async () => {
 		const host = createMockHost({ settings: { ...settings }, requestPermission: async () => false });
 		host.storage.set("boot:lastPing", Date.now());

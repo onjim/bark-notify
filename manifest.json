@@ -54,7 +54,7 @@
 			"labelEn": "Notify level",
 			"default": "important",
 			"options": [
-				{ "value": "all", "label": "全推（含完成/开始）", "labelEn": "All events" },
+				{ "value": "all", "label": "完成 + 决策 + 出错（默认过滤秒回）", "labelEn": "Completion + decisions + errors (fast runs filtered)" },
 				{ "value": "important", "label": "只推：需决策 + 出错", "labelEn": "Only decisions + failures" },
 				{ "value": "silent", "label": "全静音（只记站内）", "labelEn": "Silent (in-app log only)" }
 			]
@@ -70,14 +70,14 @@
 			"hint": "最近 N 秒内浏览器有过交互 → 不推手机，只在站内提示。0 = 关闭该判断。"
 		},
 		{
-			"key": "minRunMs",
+			"key": "minRunMinutes",
 			"type": "number",
-			"label": "最短运行时长才推「完成」",
-			"labelEn": "Only announce runs longer than (ms)",
-			"default": 20000,
+			"label": "完成通知的最短运行时长（分钟）",
+			"labelEn": "Only announce runs longer than (minutes)",
+			"default": 5,
 			"min": 0,
-			"max": 600000,
-			"hint": "秒回的小轮次不值得打断你。"
+			"max": 10,
+			"hint": "仅正常完成的任务运行超过此时长才推送；默认 5 分钟，0 = 不限制。开始不推送，出错和需要决策仍及时推送。"
 		},
 		{
 			"key": "dedupSec",
