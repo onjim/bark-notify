@@ -9,7 +9,7 @@
 	"descriptionEn": "Pushes to Bark when a run finishes, needs your decision, or dies. Sound encodes priority; suppresses to in-app toast while the browser tab is active; tapping a push returns to the conversation or acks it.",
 	"homepage": "https://github.com/onjim/bark-notify",
 	"apiVersion": 2,
-	"view": true,
+	"view": false,
 	"permissions": [
 		"net",
 		"secrets",
@@ -43,9 +43,9 @@
 		{
 			"key": "webBase",
 			"type": "text",
-			"label": "pi-web-ui 外网地址（必填，无默认值）",
-			"labelEn": "Cockpit public URL (required, no default)",
-			"hint": "必填，例 https://cockpit.example.com —— 反代域名，干方不要带端口（带端口从外网进不来）。推送的点击跳转与 /ack 都基于它；不填则推送无跳转链接。"
+			"label": "pi-web-ui 外网地址（可选）",
+			"labelEn": "pi-web-ui public URL (optional)",
+			"hint": "选填，例如 https://cockpit.example.com。填写后推送可跳转回 pi-web-ui；不填仍可接收通知，但没有跳转链接。"
 		},
 		{
 			"key": "mode",
@@ -93,7 +93,7 @@
 			"type": "text",
 			"label": "通知图标 URL（默认空）",
 			"labelEn": "Icon URL (empty by default)",
-			"hint": "默认留空 = 用 Bark App 自己的默认图标。想固定换图再填：≥150×150 PNG，否则 critical 级的附件图会被 APNs 丢。临时试图用设置页的「🖼️ 带图测试」，不会写回这里。"
+			"hint": "默认留空 = 用 Bark App 自己的默认图标。想固定换图再填：≥150×150 PNG，否则 critical 级的附件图会被 APNs 丢。"
 		},
 		{
 			"key": "morningCron",

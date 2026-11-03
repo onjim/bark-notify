@@ -4,6 +4,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import plugin, { classifyEvent, buildPayload, dedupeKey, pickProject } from "./index.mjs";
 import { createMockHost } from "./sdk/index.mjs";
 
@@ -85,11 +86,25 @@ describe("buildPayload", () => {
 describe("activate（mock host）", () => {
 	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", muteWhenActive: 0, minRunMs: 0, dedupSec: 0, icon: "https://x/i.png", morningCron: "" };
 
-	it("注册 UI 档位 / HTTP 端点 / AI 工具 / 事件订阅", async () => {
+	it("只提供原生设置，状态使用配置档位且不注册测试命令", async () => {
+		const manifest = JSON.parse(await readFile(new URL("./manifest.json", import.meta.url), "utf8"));
+		assert.equal(manifest.view, false);
+		assert.ok(!manifest.ui?.settings);
+		const host = createMockHost({ settings });
+		host.storage.set("mode", "silent");
+		await plugin.activate(host);
+		const route = host.mock.routes.find((r) => (r.path || r[1]) === "/status");
+		let body;
+		(route?.handler || route?.[2])?.({}, { writeHead: () => {}, end: (s) => { body = s; } });
+		assert.equal(JSON.parse(body).hasKey, true);
+		assert.equal(JSON.parse(body).mode, "all");
+		assert.equal(host.mock.calls("registerCommand").length, 0);
+	});
+
+	it("注册 HTTP 端点 / AI 工具 / 事件订阅", async () => {
 		const host = createMockHost({ settings });
 		await plugin.activate(host);
 		const calls = host.mock.calls();
-		assert.ok(calls.some((c) => c.method === "ui.register"), "应注册 composer 档位");
 		assert.ok(calls.some((c) => c.method === "onRunEvent"), "应订阅 run 事件");
 		assert.ok(
 			calls.some((c) => c.method === "registerAgentTool" || c.method === "registerTool"),
@@ -156,8 +171,8 @@ describe("activate（mock host）", () => {
 		assert.equal(fetches.length, 0);
 	});
 
-	it("缺 Bark 服务器 / 密钥 / 外网地址 → 不发出，并点名缺哪项", async () => {
-		for (const miss of ["server", "barkKey", "webBase"]) {
+	it("缺 Bark 服务器或密钥 → 不发出，并点名缺哪项", async () => {
+		for (const miss of ["server", "barkKey"]) {
 			const host = createMockHost({ settings: { ...settings, [miss]: "" } });
 			const fetches = [];
 			host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
@@ -171,6 +186,26 @@ describe("activate（mock host）", () => {
 			const out = JSON.parse(body);
 			assert.equal(out.configured, false, `${miss} 缺失应报 configured:false`);
 			assert.ok(out.missing.includes(miss), `missing 应包含 ${miss}`);
+		}
+	});
+
+	it("外网地址可选：留空照常推送，有地址时附跳转链接", async () => {
+		for (const webBase of ["", "https://cockpit.test"]) {
+			const host = createMockHost({ settings: { ...settings, webBase } });
+			host.storage.set("boot:lastPing", Date.now());
+			const fetches = [];
+			host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+			await plugin.activate(host);
+			host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "optional-url", at: Date.now() });
+			await new Promise((r) => setTimeout(r, 30));
+			assert.equal(fetches.length, 1);
+			const payload = JSON.parse(fetches[0].init.body);
+			if (webBase) assert.equal(payload.url, `${webBase}/`);
+			else assert.equal("url" in payload, false);
+			const ping = host.mock.routes.find((r) => (r.path || r[1]) === "/ping");
+			let body = "";
+			(ping?.handler || ping?.[2])?.({}, { writeHead: () => {}, end: (s) => { body = s; } });
+			assert.equal(JSON.parse(body).configured, true);
 		}
 	});
 
@@ -213,7 +248,7 @@ describe("activate（mock host）", () => {
 		assert.equal(host.mock.calls("requestPermission").length, 0);
 	});
 
-describe("测试按钮与图标", () => {
+describe("图标", () => {
 	it("单条 iconOverride 优先于设置里的 icon", () => {
 		const p = buildPayload({ barkKey: "K1", icon: "https://cfg/i.png" }, { kind: "done", title: "t", body: "b", iconOverride: "https://shot/a.png" });
 		assert.equal(p.icon, "https://shot/a.png");
@@ -224,37 +259,6 @@ describe("测试按钮与图标", () => {
 		assert.equal("icon" in p, false);
 	});
 
-	it("🖼️ 带图测试用输入框的 URL，📣 文字自检回落到设置值", async () => {
-		const cases = [
-			{ msgIcon: "https://shot/a.png", cfgIcon: "", want: "https://shot/a.png" },
-			{ msgIcon: "", cfgIcon: "https://cfg/i.png", want: "https://cfg/i.png" },
-			{ msgIcon: "", cfgIcon: "", want: undefined },
-		];
-		for (const c of cases) {
-			const host = createMockHost({ settings: { ...settings, icon: c.cfgIcon } });
-			host.storage.set("boot:lastPing", Date.now());
-			const fetches = [];
-			host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
-			await plugin.activate(host);
-			host.mock.emit("onMessage", c.msgIcon ? { action: "bark-notify:test", icon: c.msgIcon } : { action: "bark-notify:test" });
-			await new Promise((r) => setTimeout(r, 30));
-			assert.equal(fetches.length, 1, `应推一条（icon=${JSON.stringify(c.msgIcon)}）`);
-			const body = JSON.parse(fetches[0].init.body);
-			assert.equal(body.icon, c.want, `icon 应为 ${c.want}`);
-			assert.match(body.title, c.msgIcon ? /🖼️ 带图测试/ : /🔔 Bark 自检/);
-		}
-	});
-
-	it("测试推送无视档位与前台静音（force），静音档也能验通道", async () => {
-		const host = createMockHost({ settings: { ...settings, mode: "silent", muteWhenActive: 3600 } });
-		host.storage.set("boot:lastPing", Date.now());
-		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
-		await plugin.activate(host);
-		host.mock.emit("onMessage", { action: "bark-notify:test" }); // onMessage 顺手把「人在屏前」刷新了
-		await new Promise((r) => setTimeout(r, 30));
-		assert.equal(fetches.length, 1, "静音档 + 前台活跃也要能测出通道");
-	});
 });
 
 describe("项目名提取", () => {

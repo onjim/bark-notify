@@ -147,7 +147,7 @@ export function buildPayload(cfg, note) {
 		level: note.level || "active",
 		archived: Boolean(note.archived),
 	};
-	// 单条临时图标优先于设置里的 icon（设置页「🖼️ 带图测试」靠这个覆盖）；两处都空就不带该字段
+	// 单条图标优先于设置里的 icon；两处都空就不带该字段
 	const icon = String(note.iconOverride || cfg.icon || "").trim();
 	if (icon) payload.icon = icon;
 	if (note.url) payload.url = note.url;
@@ -166,7 +166,6 @@ export default definePlugin({
 		const dedup = new Map();             // hash → 最近投递 ms
 		const recent = [];                  // 最近 20 条投递记录（/status 用）
 		let lastClientActivity = 0;
-		let modeOverride = host.storage.get("mode", null);
 		let morningStop = null;
 
 		const cfgOf = () => {
@@ -177,12 +176,12 @@ export default definePlugin({
 				catch { return String(s[k] ?? "").trim(); }
 			};
 			return {
-				// 身份信息一律不给默认值：Bark 服务器 / 设备密钥 / 外网地址都该使用者自己填
+				// 地址和密钥均由使用者配置，不提供默认值
 				server: clean(s.server),
 				barkKey: secret("barkKey"),
 				webBase: clean(s.webBase),
 				icon: clean(s.icon),
-				mode: modeOverride || s.mode || "important",
+				mode: s.mode || "important",
 				muteWhenActive: Number(s.muteWhenActive ?? 120),
 				minRunMs: Number(s.minRunMs ?? 20000),
 				dedupSec: Number(s.dedupSec ?? 300),
@@ -190,7 +189,7 @@ export default definePlugin({
 			};
 		};
 		/** 缺必填项 / 域名不在出站白名单：两条都让人当场看到，而不是默默不发 */
-		const missingCfg = () => ["server", "barkKey", "webBase"].filter((k) => !String(cfgOf()[k] || "").trim());
+		const missingCfg = () => ["server", "barkKey"].filter((k) => !String(cfgOf()[k] || "").trim());
 		/** 已批过 / 已问过的主机：批过的不再打扰，被拒的也不再每轮重弹。 */
 		const netGranted = new Set();
 		const netAsked = new Set();
@@ -339,61 +338,16 @@ export default definePlugin({
 		const offTool = host.onToolEvent?.((ev) => { handleEvent(ev, "tool").catch(() => {}); });
 		// 客户端上行消息统一交给下面的 handleUpstream（它顺手记「人在屏前」）
 
-		/** —— 档位开关（composer 按钮组，切了立刻生效）—— */
-		const MODES = [
-			{ value: "all", label: "🔔 全推" },
-			{ value: "important", label: "🙋 只重要" },
-			{ value: "silent", label: "🔕 静音" },
-		];
 		const curMode = () => cfgOf().mode;
-		let uiOff = null;
-		try {
-			uiOff = host.ui.register({
-				slot: "composer.actions", id: "mode", kind: "select", order: 90,
-				label: "Bark 推送档位", action: "bark-notify:mode",
-				value: curMode(), hint: "全推 / 只推需决策与出错 / 全静音",
-				options: MODES,
-			});
-		} catch (err) { host.log("warn", `UI 注册失败: ${String(err?.message || err)}`); }
-		// ui.update 的入参形状宿主版本间有差异，两条路都试；失败不影响投递主流程
-		const syncUi = () => {
-			try { host.ui.update?.("mode", { value: curMode(), badge: curMode() === "silent" ? "🔕" : "" }); } catch {}
-			try { uiOff?.update?.({ value: curMode() }); } catch {}
-		};
 
 		function handleUpstream(msg, reply) {
 			lastClientActivity = Date.now();
 			const action = typeof msg?.action === "string" ? msg.action : "";
-			if (action === "bark-notify:mode") {
-				const v = String(msg.value ?? "").trim();
-				if (MODES.some((m) => m.value === v)) { modeOverride = v; host.storage.set("mode", v); syncUi(); }
-				reply?.({ ok: true, mode: curMode() });
-				return;
-			}
 			if (action === "bark-notify:status") { reply?.({ ok: true, mode: curMode(), recent: recent.slice(0, 10), hasKey: Boolean(cfgOf().barkKey), icon: cfgOf().icon || null, missing: missingCfg(), capabilities: caps }); return; }
-			if (action === "bark-notify:test") {
-				// 面板两个按钮共用：不传 icon = 走设置里的图标；传了只影响这一条，不写回设置
-				const iconOverride = String(msg.icon ?? "").trim();
-				const effIcon = iconOverride || String(cfgOf().icon || "").trim();
-				const sound = String(msg.sound || (iconOverride ? "bell" : "glass")).trim();
-				notify({
-					kind: "done",
-					title: iconOverride ? "🖼️ 带图测试 · 看图标对不对" : "🔔 Bark 自检 · 站内触发",
-					body: [
-						`模式 ${curMode()} · 看到即通道通`,
-						`图标 ${effIcon || "（空 → Bark 默认图标）"}`,
-						`声音 ${sound} · 前台静音 ${cfgOf().muteWhenActive}s`,
-					].join("\n"),
-					sound, level: "active", badge: 1, iconOverride: iconOverride || undefined,
-				}, { force: true });
-				reply?.({ ok: true, icon: effIcon || null, sound });
-				return;
-			}
 		}
 		// 能回包的优先；只有 onMessage（旧宿主/mock）时走 fire-and-forget，重复投递由去重窗口吃掉
 		const offClient = host.onClientMessage?.((msg, reply) => handleUpstream(msg, reply));
 		const offUpstream = host.onMessage((msg) => handleUpstream(msg, () => {}));
-		host.effect?.("bark-ui-item", () => { try { uiOff?.(); } catch {} });
 
 		/** 能力自检：权限族声明不全时，调用会被宿主静默拒（只留一行日志），翻志很痛。
 		 *  这里逐项探一下，结果挂到 /ping 与设置面板，拒了当场就知道是哪个族。 */
@@ -413,12 +367,12 @@ export default definePlugin({
 		probe("http", () => (typeof host.route === "function" ? "ok" : "missing"));
 		probe("schedule", () => (typeof host.schedule === "function" ? "ok" : "missing（无能力族，靠自然可用）"));
 		probe("net", () => (typeof host.fetch === "function" ? "ok" : "missing"));
-		caps.ui = uiOff ? "ok" : "register 失败（看日志）";
+		probe("ui", () => (typeof host.ui === "object" ? "ok" : "missing"));
 		const capsBlocked = Object.entries(caps).filter(([, v]) => v !== "ok");
 
 		/** —— 外部/手机回环 HTTP（挂在 /plugins-api/bark-notify/*）—— */
 		host.route("GET", "/ping", (_req, res) => sendJson(res, 200, { ok: true, id: "bark-notify", configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null, mode: curMode(), hasKey: Boolean(cfgOf().barkKey), server: cfgOf().server || null, webBase: cfgOf().webBase || null, netAllowlist: [...ALLOWED_HOSTS, ...netGranted], permissions: ["net", "secrets", "storage", "ui", "http", "tools", "notify", "chat"], capabilities: caps, blocked: capsBlocked }));
-		host.route("GET", "/status", (_req, res) => sendJson(res, 200, { ok: true, mode: curMode(), recent, icon: cfgOf().icon || null, configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null }));
+		host.route("GET", "/status", (_req, res) => sendJson(res, 200, { ok: true, mode: curMode(), recent, icon: cfgOf().icon || null, hasKey: Boolean(cfgOf().barkKey), configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null }));
 		/** 外部推一条：共用插件里的配置（脚本/其它机器不用各自存 key）。
 		 *  三种进数据都要接：宿主 json parser 已把 body 消耗成 req.body（主流情况）、
 		 *  原始流（未接 parser 时）、以及 GET query（手机上直接输 URL 就能测）。 */
@@ -499,45 +453,6 @@ export default definePlugin({
 		const regToolFn = typeof host.registerAgentTool === "function" ? host.registerAgentTool : host.registerTool;
 		const offToolReg = typeof regToolFn === "function" ? regToolFn.call(host, toolDef) : undefined;
 		if (regToolFn === undefined) host.log("warn", "宿主无 registerAgentTool/registerTool，AI 推送工具未注册");
-		// 实里要的是 run（不是 execute）——缺 run 会被宿主默默丢弃，只留一行日志
-		const barkCommand = {
-			name: "bark",
-			description: "推一条 Bark 测试通知：/bark 你好 / 或者 /bark silent 只记账",
-			argumentHint: "[文字] [silent]",
-			run: async (...a) => {
-				const args = typeof a[0] === "string" ? a[0] : typeof a[1] === "string" ? a[1] : "";
-				const quiet = /\bsilent\b/i.test(String(args || ""));
-				const text = String(args || "").replace(/\bsilent\b/i, "").trim();
-				const out = await notify({
-					kind: "done", title: quiet ? "🔕 已记账（静默）" : "🔔 /bark 手动推送",
-					body: text || `插件自检 · 模式 ${curMode()}`, sound: quiet ? "silence" : "glass",
-					level: "active", group: "pi", archived: quiet, badge: quiet ? 0 : 1,
-				}, { force: true });
-				return out.ok ? "✅ 已推送" : `❌ 未推送：${out.skipped || out.error || out.status || "unknown"}`;
-			},
-		};
-		const offCmd = host.registerCommand?.({ ...barkCommand, execute: barkCommand.run });
-		// /bark-icon <url>：不靠设置面板也能验图标（面板入口藏得深）
-		const iconCmd = {
-			name: "bark-icon",
-			description: "带图推一条：/bark-icon https://example.com/icon.png（只这一条带图，不写回设置）",
-			argumentHint: "<图片 URL> [说明文字]",
-			run: async (...a) => {
-				const args = String(typeof a[0] === "string" ? a[0] : typeof a[1] === "string" ? a[1] : "").trim();
-				const m = args.match(/^(https?:\/\/\S+)\s*(.*)$/i);
-				const icon = m ? m[1] : looksUrl(args) ? args : "";
-				if (!icon) return "❌ 没给图片 URL：/bark-icon https://example.com/i.png [文字]";
-				const text = (m && m[2] ? m[2] : "").trim();
-				const out = await notify({
-					kind: "done", title: "🖼️ /bark-icon 带图测试",
-					body: text ? `${text}\n图标 ${icon}` : `图标 ${icon}\n看清了就把这个 URL 填到设置的 icon 项`,
-					sound: "bell", level: "active", group: "pi", badge: 1, iconOverride: icon,
-				}, { force: true });
-				return out.ok ? `✅ 已带图推送：${icon}` : `❌ 未推送：${out.skipped || out.hint || out.error || out.status || "unknown"}`;
-			},
-		};
-		const offIconCmd = host.registerCommand?.({ ...iconCmd, execute: iconCmd.run });
-
 		/** —— 晨报定时任务（cron 空 = 关闭；设置改动后重挂）—— */
 		function remountMorning() {
 			try { morningStop?.(); } catch {}
@@ -559,7 +474,7 @@ export default definePlugin({
 			const h = hostOf(cfgOf().server);
 			// 换了 Bark 域名：新域名可以重新申请一次授权
 			if (h !== lastServerHost) { netAsked.clear(); lastServerHost = h; }
-			syncUi(); remountMorning();
+			remountMorning();
 		});
 
 		const keyState = cfgOf().barkKey ? "已配" : "未配 → 设置里填设备密钥";
@@ -592,9 +507,8 @@ export default definePlugin({
 		}
 
 		return () => {
-			for (const off of [offRun, offTool, offUpstream, offClient, offToolReg, offCmd, offIconCmd, offSettings]) { try { off?.(); } catch {} }
+			for (const off of [offRun, offTool, offUpstream, offClient, offToolReg, offSettings]) { try { off?.(); } catch {} }
 			try { morningStop?.(); } catch {}
-			try { uiOff?.(); } catch {}
 		};
 	},
 });
