@@ -174,9 +174,12 @@ describe("activate（mock host）", () => {
 		}
 	});
 
-	it("Bark 域名不在 netAllowlist → 当场点名，不静默丢弃", () => {
+	it("自架域名未获授权 → 申请一次，仍拒则当场点名", () => {
 		const host = createMockHost({ settings: { ...settings, server: "https://bark.myown.net" } });
 		return plugin.activate(host).then(async () => {
+			const asked = host.mock.calls("requestPermission");
+			assert.equal(asked.length, 1, "activate 应就该主机申请一次出站授权");
+			assert.deepEqual(asked[0].args[0].hosts, ["bark.myown.net"]);
 			const ping = host.mock.routes.find((r) => (r.path || r[1]) === "/ping");
 			let body = "";
 			(ping?.handler || ping?.[2])?.({}, { writeHead: () => {}, end: (s) => { body = s; } });
@@ -184,6 +187,30 @@ describe("activate（mock host）", () => {
 			assert.match(String(out.allowlistHint), /bark\.myown\.net/);
 			assert.match(String(out.allowlistHint), /netAllowlist/);
 		});
+	});
+
+	it("用户批准自架域名 → 放行，且不再重复弹框", async () => {
+		const host = createMockHost({
+			settings: { ...settings, server: "https://bark.myown.net" },
+			requestPermission: async () => true,
+		});
+		const fetches = [];
+		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		await plugin.activate(host);
+		await new Promise((r) => setTimeout(r, 30));
+		assert.ok(fetches.length >= 1, "批准后应能真的发出去");
+		assert.equal(fetches[0].url, "https://bark.myown.net/push");
+		const before = host.mock.calls("requestPermission").length;
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "conv-granted", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(host.mock.calls("requestPermission").length, before, "已批过的主机不该再弹框");
+	});
+
+	it("默认 api.day.app 无需申请授权", async () => {
+		const host = createMockHost({ settings: { ...settings, server: "https://api.day.app" } });
+		host.fetch = async () => ({ status: 200, text: async () => '{"code":200}' });
+		await plugin.activate(host);
+		assert.equal(host.mock.calls("requestPermission").length, 0);
 	});
 
 describe("测试按钮与图标", () => {

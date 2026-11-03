@@ -14,8 +14,9 @@
  */
 import { definePlugin } from "./sdk/index.mjs";
 
-/** 与 manifest.netAllowlist 必须保持一致（改那边记得同步这里）：宿主对 net 是 fail-closed，
- *  自架 Bark 域名不在这张表里，推送会被静默拒——所以填完当场点名提醒，不让人猜。 */
+/** manifest 里的兜底名单（与 netAllowlist 保持一致）：只放公共默认域名。
+ *  个人自架域名走 host.requestPermission 动态授权（用户点一次同意，宿主记住），
+ *  不写进公共仓库的 manifest。 */
 const ALLOWED_HOSTS = ["api.day.app", "example.com", "github.com", "avatars.githubusercontent.com"];
 const hostOf = (urlLike) => { try { return new URL(String(urlLike || "")).hostname.toLowerCase(); } catch { return ""; } };
 const looksUrl = (value) => /^[a-z][a-z0-9+.-]*:\/\//i.test(String(value || "").trim());
@@ -190,10 +191,40 @@ export default definePlugin({
 		};
 		/** 缺必填项 / 域名不在出站白名单：两条都让人当场看到，而不是默默不发 */
 		const missingCfg = () => ["server", "barkKey", "webBase"].filter((k) => !String(cfgOf()[k] || "").trim());
+		/** 已批过 / 已问过的主机：批过的不再打扰，被拒的也不再每轮重弹。 */
+		const netGranted = new Set();
+		const netAsked = new Set();
+		/** 向宿主申请该主机的出站授权（用户可在确认框记住）。mock 环境直接回 false。 */
+		async function ensureNetGrant(server) {
+			const h = hostOf(server);
+			if (!h) return false;
+			if (ALLOWED_HOSTS.some((a) => h === a || h.endsWith(`.${a}`))) return true;
+			if (netGranted.has(h)) return true;
+			if (netAsked.has(h)) return false;
+			netAsked.add(h);
+			try {
+				const ok = await host.requestPermission({
+					family: "net",
+					hosts: [h],
+					reason: "Bark 推送需要访问你自建的 Bark 服务器",
+				});
+				if (ok) {
+					netGranted.add(h);
+					host.log("info", `已获准出站：${h}`);
+				} else {
+					host.log("warn", `未获准出站：${h}（设置 → 界面插件 → Bark 推送 → 已授权能力里放行，或把它加进 manifest.netAllowlist 再重装）`);
+				}
+				return Boolean(ok);
+			} catch (err) {
+				host.log("warn", `申请出站授权失败：${String(err?.message || err).slice(0, 160)}`);
+				return false;
+			}
+		}
 		const allowHint = (server) => {
 			const h = hostOf(server);
 			if (!h) return "";
-			return ALLOWED_HOSTS.some((a) => h === a || h.endsWith(`.${a}`)) ? "" : `「${h}」不在 manifest.netAllowlist 里，会被宿主拒出（把它加进 netAllowlist 再重装）`;
+			if (ALLOWED_HOSTS.some((a) => h === a || h.endsWith(`.${a}`)) || netGranted.has(h)) return "";
+			return `「${h}」尚未获准出站（确认框点放行即可，无需改 manifest；已拒过则去设置 → 已授权能力放行，或加进 manifest.netAllowlist 再重装）`;
 		};
 
 		const pushUrlOf = (cfg, note) => {
@@ -223,11 +254,14 @@ export default definePlugin({
 				record({ ...note, result: "unconfigured" });
 				return { ok: false, skipped: "unconfigured", missing };
 			}
-			const allowProblem = allowHint(cfg.server);
-			if (allowProblem) {
-				host.log("warn", allowProblem);
-				record({ ...note, result: "not-allowlisted" });
-				return { ok: false, skipped: "not-allowlisted", hint: allowProblem };
+			// 自架域名：先向宿主申请一次出站授权（用户点同意即记住），批不下来才算问题
+			if (!(await ensureNetGrant(cfg.server))) {
+				const allowProblem = allowHint(cfg.server);
+				if (allowProblem) {
+					host.log("warn", allowProblem);
+					record({ ...note, result: "not-allowlisted" });
+					return { ok: false, skipped: "not-allowlisted", hint: allowProblem };
+				}
 			}
 			const mode = cfg.mode;
 			if (mode === "silent" && !opts.force) { record({ ...note, result: "muted" }); return { ok: false, skipped: "mode-silent" }; }
@@ -383,7 +417,7 @@ export default definePlugin({
 		const capsBlocked = Object.entries(caps).filter(([, v]) => v !== "ok");
 
 		/** —— 外部/手机回环 HTTP（挂在 /plugins-api/bark-notify/*）—— */
-		host.route("GET", "/ping", (_req, res) => sendJson(res, 200, { ok: true, id: "bark-notify", configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null, mode: curMode(), hasKey: Boolean(cfgOf().barkKey), server: cfgOf().server || null, webBase: cfgOf().webBase || null, netAllowlist: ALLOWED_HOSTS, permissions: ["net", "secrets", "storage", "ui", "http", "tools", "notify", "chat"], capabilities: caps, blocked: capsBlocked }));
+		host.route("GET", "/ping", (_req, res) => sendJson(res, 200, { ok: true, id: "bark-notify", configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null, mode: curMode(), hasKey: Boolean(cfgOf().barkKey), server: cfgOf().server || null, webBase: cfgOf().webBase || null, netAllowlist: [...ALLOWED_HOSTS, ...netGranted], permissions: ["net", "secrets", "storage", "ui", "http", "tools", "notify", "chat"], capabilities: caps, blocked: capsBlocked }));
 		host.route("GET", "/status", (_req, res) => sendJson(res, 200, { ok: true, mode: curMode(), recent, icon: cfgOf().icon || null, configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null }));
 		/** 外部推一条：共用插件里的配置（脚本/其它机器不用各自存 key）。
 		 *  三种进数据都要接：宿主 json parser 已把 body 消耗成 req.body（主流情况）、
@@ -520,7 +554,13 @@ export default definePlugin({
 			}, { id: "bark-notify-morning", label: "Bark 晨报", persistent: true, catchUp: "skip" });
 		}
 		remountMorning();
-		const offSettings = host.onSettingsChanged(() => { syncUi(); remountMorning(); });
+		let lastServerHost = hostOf(cfgOf().server);
+		const offSettings = host.onSettingsChanged(() => {
+			const h = hostOf(cfgOf().server);
+			// 换了 Bark 域名：新域名可以重新申请一次授权
+			if (h !== lastServerHost) { netAsked.clear(); lastServerHost = h; }
+			syncUi(); remountMorning();
+		});
 
 		const keyState = cfgOf().barkKey ? "已配" : "未配 → 设置里填设备密钥";
 		if (capsBlocked.length) host.log("warn", `能力被门控：${capsBlocked.map(([k, v]) => `${k}=${v}`).join(", ")} —— 往 manifest.permissions 里补上对应能力族再重装`);
@@ -530,6 +570,8 @@ export default definePlugin({
 		 *  用户刷新完浏览器秒知生效与否，不用开终端 curl、也不用翻宿主日志。 */
 		const bootAt = Number(host.storage.get("boot:lastPing", 0) || 0);
 		const bootMissing = missingCfg();
+		// 先申请一次（自架域名在此弹框），批下来就不算问题
+		await ensureNetGrant(cfgOf().server).catch(() => {});
 		const bootAllow = allowHint(cfgOf().server);
 		if (bootMissing.length || bootAllow) {
 			// 不齐就不推手机（推也推不出去），且不记去重时间：刷新一次提醒一次，直到填好

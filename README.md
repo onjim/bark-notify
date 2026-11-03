@@ -44,15 +44,20 @@ pi-web-ui uninstall bark-notify
 这三项是身份信息，插件**不给任何默认值**。不填就一条都不推，而且不静默：
 站内通知 + 日志 + `GET /plugins-api/bark-notify/ping` 都会点名缺什么（`"configured": false, "missing": ["server", ...]`）。
 
-**第四件事很多人漏：`manifest.netAllowlist`。** 宿主对 `net` 是 fail-closed，自架 Bark 域名不在名单里就全部拒发。
-改 manifest 里的 `netAllowlist` 加上你的域名再重装：
+**第四件事很多人漏：出站网络授权。** 宿主对 `net` 是 fail-closed，自架 Bark 域名没授权就全部拒发。
+
+自架域名**不用改 manifest**：填完服务器点保存，插件会弹一次授权确认框，点放行即可（宿主会记住，之后不再问）。
+手动漏放行或想撤销，去 设置 → 界面插件 → Bark 推送 → 已授权能力。
+
+manifest 的 `netAllowlist` 只留公共默认值（`api.day.app` 等），个人域名不进仓库。
+想要免弹框也可以走老路：加进 `netAllowlist` 再重装。
 
 ```bash
 # 改 plugins/bark-notify/manifest.json → netAllowlist 加上 "bark.example.com"
 pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷新浏览器
 ```
 
-忘了改也不会让你闷在鼓里：插件会当场点名「「bark.example.com」不在 manifest.netAllowlist 里」。
+两条路都没走通也不会让你闷在鼓里：插件会当场点名「「bark.example.com」尚未获准出站」。
 
 可选：推送档位（全推 / 只重要 / 全静音）、前台静音窗口、最短运行时长阈值、去重窗口、图标 URL（**默认空**）、晨报 cron。
 
@@ -96,7 +101,7 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
 3. `permissions` 是**封闭白名单**，`net` 又是 **fail-closed**：
    合法族只有 `fs` `fs:read` `fs:write` `ui` `tools` `http` `chat` `net` `llm` `dom` `dom:anchor` `notify` `storage` `secrets` ——
    **没有 `schedule`**（定时无需声明，写了直接「未知能力」报错），用到的 `storage`/`notify`/`chat` 一个都不能漏。
-   换你自己的 Bark 域名记得同步改 `netAllowlist`，否则出站全拒。
+   换你自己的 Bark 域名靠 `host.requestPermission` 动态授权（首次推送时弹框放行），否则出站全拒。
 4. 权限漏声明时宿主往往只是**静默拒绝**，所以本插件在 activate 时逐项探测能力，结果挂在
    `GET /plugins-api/bark-notify/ping` 的 `capabilities` / `blocked` 字段和启动日志里（`能力 9/9 可用`）。
 
