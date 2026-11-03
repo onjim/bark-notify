@@ -86,6 +86,11 @@ describe("buildPayload", () => {
 describe("activate（mock host）", () => {
 	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", muteWhenActive: 0, minRunMs: 0, dedupSec: 0, icon: "https://x/i.png", morningCron: "" };
 
+	const requestTest = (host, headers = { "content-type": "application/json" }) => new Promise((resolve) => {
+		const route = host.mock.routes.find((r) => (r.path || r[1]) === "/test");
+		(route?.handler || route?.[2])({ headers }, { writeHead: (status) => { resolve.status = status; }, end: (body) => resolve({ status: resolve.status, body: JSON.parse(body) }) });
+	});
+
 	it("只提供原生设置，状态使用配置档位且不注册测试命令", async () => {
 		const manifest = JSON.parse(await readFile(new URL("./manifest.json", import.meta.url), "utf8"));
 		assert.equal(manifest.view, false);
@@ -246,6 +251,72 @@ describe("activate（mock host）", () => {
 		host.fetch = async () => ({ status: 200, text: async () => '{"code":200}' });
 		await plugin.activate(host);
 		assert.equal(host.mock.calls("requestPermission").length, 0);
+	});
+	it("保存新域名立即申请授权；修改密钥不重新申请", async () => {
+		const host = createMockHost({ settings: { ...settings }, requestPermission: async () => false });
+		host.storage.set("boot:lastPing", Date.now());
+		await plugin.activate(host);
+		host.mock.emitSettings({ server: "https://new.example.net" });
+		await new Promise((r) => setImmediate(r));
+		assert.equal(host.mock.calls("requestPermission").length, 1);
+		host.mock.emitSettings({ barkKey: "changed" });
+		await new Promise((r) => setImmediate(r));
+		assert.equal(host.mock.calls("requestPermission").length, 1);
+		assert.ok(host.mock.calls("notify").some((c) => c.args[0] === "warning"));
+	});
+
+	it("保存配置后下一次推送使用新设置并重挂晨报", async () => {
+		const host = createMockHost({ settings: { ...settings } });
+		host.storage.set("boot:lastPing", Date.now());
+		const fetches = [];
+		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		await plugin.activate(host);
+		host.secrets.set("setting:barkKey", "NEW_KEY");
+		host.mock.emitSettings({ server: "https://api.day.app", webBase: "", mode: "all", icon: "https://example.com/new.png", morningCron: "0 9 * * *" });
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "updated", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(fetches.length, 1);
+		assert.equal(fetches[0].url, "https://api.day.app/push");
+		const payload = JSON.parse(fetches[0].init.body);
+		assert.equal(payload.device_key, "NEW_KEY");
+		assert.equal(payload.icon, "https://example.com/new.png");
+		assert.equal("url" in payload, false);
+		assert.equal(host.mock.schedules[0].spec, "0 9 * * *");
+	});
+
+	it("手动测试可重试拒绝的授权，不泄露返回正文并绕过去重", async () => {
+		let granted = false;
+		const host = createMockHost({ settings: { ...settings, server: "https://new.example.net", mode: "silent", dedupSec: 300 }, requestPermission: async () => granted });
+		host.storage.set("boot:lastPing", Date.now());
+		let sent = 0;
+		host.fetch = async () => { sent++; return { status: 200, text: async () => '{"code":200,"secret":"DO_NOT_RETURN"}' }; };
+		await plugin.activate(host);
+		assert.equal((await requestTest(host, {})).status, 415);
+		granted = true;
+		for (let i = 0; i < 2; i++) {
+			const result = await requestTest(host);
+			assert.equal(result.status, 200);
+			assert.deepEqual(result.body, { ok: true, status: 200 });
+		}
+		assert.equal(sent, 2);
+	});
+
+	it("并发请求共用授权；授权期间配置变更时不发旧配置", async () => {
+		let resolveGrant;
+		const host = createMockHost({ settings: { ...settings }, requestPermission: () => new Promise((resolve) => { resolveGrant = resolve; }) });
+		host.storage.set("boot:lastPing", Date.now());
+		let sent = 0;
+		host.fetch = async () => { sent++; return { status: 200, text: async () => '{"code":200}' }; };
+		await plugin.activate(host);
+		host.mock.emitSettings({ server: "https://new.example.net" });
+		const first = requestTest(host);
+		const second = requestTest(host);
+		assert.equal(host.mock.calls("requestPermission").length, 1);
+		host.mock.emitSettings({ server: "https://example.com" });
+		resolveGrant(true);
+		assert.equal((await first).body.reason, "configuration-changed");
+		assert.equal((await second).body.reason, "configuration-changed");
+		assert.equal(sent, 0);
 	});
 
 describe("图标", () => {

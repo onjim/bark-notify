@@ -46,8 +46,16 @@ Bark 服务器和设备密钥为必填项，插件**不给默认值**。缺少�
 
 **出站网络授权：** 宿主对 `net` 是 fail-closed，自架 Bark 域名没授权就全部拒发。
 
-自架域名**不用改 manifest**：填完服务器点保存，插件会弹一次授权确认框，点放行即可（宿主会记住，之后不再问）。
+自架域名**不用改 manifest**：保存新服务器地址后插件会尝试申请授权，在确认框中放行即可。若授权未完成，插件会给出站内提醒。
 手动漏放行或想撤销，去 设置 → 界面插件 → Bark 推送 → 已授权能力。
+
+授权未完成时，可在浏览器连接着 pi-web-ui 的情况下主动重试并发送一条测试通知：
+
+```bash
+curl -X POST http://localhost:8787/plugins-api/bark-notify/test -H 'Content-Type: application/json' -d '{}'
+```
+
+该接口使用宿主的访问控制；若启用了 `PI_WEB_TOKEN`，请求还需按宿主配置携带凭据。它会真实发送通知，响应不包含设备密钥。
 
 manifest 的 `netAllowlist` 只留公共默认值（`api.day.app` 等），个人域名不进仓库。
 想要免弹框也可以走老路：加进 `netAllowlist` 再重装。

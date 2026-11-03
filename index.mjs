@@ -193,31 +193,38 @@ export default definePlugin({
 		/** 已批过 / 已问过的主机：批过的不再打扰，被拒的也不再每轮重弹。 */
 		const netGranted = new Set();
 		const netAsked = new Set();
+		const netPending = new Map();
 		/** 向宿主申请该主机的出站授权（用户可在确认框记住）。mock 环境直接回 false。 */
-		async function ensureNetGrant(server) {
+		async function ensureNetGrant(server, { retry = false } = {}) {
 			const h = hostOf(server);
 			if (!h) return false;
 			if (ALLOWED_HOSTS.some((a) => h === a || h.endsWith(`.${a}`))) return true;
+			if (netPending.has(h)) return netPending.get(h);
+			if (retry) { netAsked.delete(h); netGranted.delete(h); }
 			if (netGranted.has(h)) return true;
 			if (netAsked.has(h)) return false;
 			netAsked.add(h);
-			try {
-				const ok = await host.requestPermission({
-					family: "net",
-					hosts: [h],
-					reason: "Bark 推送需要访问你自建的 Bark 服务器",
-				});
-				if (ok) {
-					netGranted.add(h);
-					host.log("info", `已获准出站：${h}`);
-				} else {
-					host.log("warn", `未获准出站：${h}（设置 → 界面插件 → Bark 推送 → 已授权能力里放行，或把它加进 manifest.netAllowlist 再重装）`);
+			const pending = (async () => {
+				try {
+					const ok = await host.requestPermission({
+						family: "net",
+						hosts: [h],
+						reason: "Bark 推送需要访问你自建的 Bark 服务器",
+					});
+					if (ok) {
+						netGranted.add(h);
+						host.log("info", `已获准出站：${h}`);
+					} else {
+						host.log("warn", `未获准出站：${h}（设置 → 界面插件 → Bark 推送 → 已授权能力里放行，或手动重试）`);
+					}
+					return Boolean(ok);
+				} catch (err) {
+					host.log("warn", `申请出站授权失败：${String(err?.message || err).slice(0, 160)}`);
+					return false;
 				}
-				return Boolean(ok);
-			} catch (err) {
-				host.log("warn", `申请出站授权失败：${String(err?.message || err).slice(0, 160)}`);
-				return false;
-			}
+			})();
+			netPending.set(h, pending);
+			try { return await pending; } finally { netPending.delete(h); }
 		}
 		const allowHint = (server) => {
 			const h = hostOf(server);
@@ -254,13 +261,16 @@ export default definePlugin({
 				return { ok: false, skipped: "unconfigured", missing };
 			}
 			// 自架域名：先向宿主申请一次出站授权（用户点同意即记住），批不下来才算问题
-			if (!(await ensureNetGrant(cfg.server))) {
+			if (!(await ensureNetGrant(cfg.server, { retry: opts.retryAuthorization }))) {
 				const allowProblem = allowHint(cfg.server);
 				if (allowProblem) {
 					host.log("warn", allowProblem);
 					record({ ...note, result: "not-allowlisted" });
 					return { ok: false, skipped: "not-allowlisted", hint: allowProblem };
 				}
+			}
+			if (opts.retryAuthorization && (cfgOf().server !== cfg.server || cfgOf().barkKey !== cfg.barkKey)) {
+				return { ok: false, skipped: "configuration-changed" };
 			}
 			const mode = cfg.mode;
 			if (mode === "silent" && !opts.force) { record({ ...note, result: "muted" }); return { ok: false, skipped: "mode-silent" }; }
@@ -274,7 +284,7 @@ export default definePlugin({
 			// 秒级去重
 			const k = dedupeKey(note);
 			const now = Date.now();
-			if (cfg.dedupSec > 0) {
+			if (cfg.dedupSec > 0 && !opts.bypassDedup) {
 				const prev = dedup.get(k);
 				if (prev && now - prev < cfg.dedupSec * 1000) { record({ ...note, result: "dedup" }); return { ok: false, skipped: "dedup" }; }
 				dedup.set(k, now);
@@ -373,6 +383,15 @@ export default definePlugin({
 		/** —— 外部/手机回环 HTTP（挂在 /plugins-api/bark-notify/*）—— */
 		host.route("GET", "/ping", (_req, res) => sendJson(res, 200, { ok: true, id: "bark-notify", configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null, mode: curMode(), hasKey: Boolean(cfgOf().barkKey), server: cfgOf().server || null, webBase: cfgOf().webBase || null, netAllowlist: [...ALLOWED_HOSTS, ...netGranted], permissions: ["net", "secrets", "storage", "ui", "http", "tools", "notify", "chat"], capabilities: caps, blocked: capsBlocked }));
 		host.route("GET", "/status", (_req, res) => sendJson(res, 200, { ok: true, mode: curMode(), recent, icon: cfgOf().icon || null, hasKey: Boolean(cfgOf().barkKey), configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null }));
+		host.route("POST", "/test", async (req, res) => {
+			const contentType = String(req?.headers?.["content-type"] || "").split(";")[0].trim().toLowerCase();
+			if (contentType !== "application/json") return sendJson(res, 415, { ok: false, error: "application/json required" });
+			const out = await notify({ kind: "done", title: "Bark 推送测试", body: "配置测试通知", sound: "glass", level: "active", badge: 1 },
+				{ force: true, bypassDedup: true, retryAuthorization: true });
+			const result = { ok: out.ok, ...(out.skipped ? { reason: out.skipped } : {}), ...(out.missing ? { missing: out.missing } : {}), ...(out.status ? { status: out.status } : {}) };
+			if (!out.ok && !out.skipped && !out.status) result.reason = "delivery-failed";
+			sendJson(res, out.ok ? 200 : 502, result);
+		});
 		/** 外部推一条：共用插件里的配置（脚本/其它机器不用各自存 key）。
 		 *  三种进数据都要接：宿主 json parser 已把 body 消耗成 req.body（主流情况）、
 		 *  原始流（未接 parser 时）、以及 GET query（手机上直接输 URL 就能测）。 */
@@ -473,7 +492,14 @@ export default definePlugin({
 		const offSettings = host.onSettingsChanged(() => {
 			const h = hostOf(cfgOf().server);
 			// 换了 Bark 域名：新域名可以重新申请一次授权
-			if (h !== lastServerHost) { netAsked.clear(); lastServerHost = h; }
+			if (h !== lastServerHost) {
+				lastServerHost = h;
+				if (h) void ensureNetGrant(cfgOf().server, { retry: true }).then((ok) => {
+					if (hostOf(cfgOf().server) !== h) return;
+					if (ok) host.log("info", `Bark 服务器出站授权已就绪：${h}`);
+					else host.notify("warning", `Bark 服务器出站授权未完成，请在已授权能力中检查，或手动重试。`, "Bark network authorization is not ready.");
+				});
+			}
 			remountMorning();
 		});
 
