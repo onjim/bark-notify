@@ -5,8 +5,8 @@
 	"version": "0.1.0",
 	"icon": "🔔",
 	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9\"/><path d=\"M13.73 21a2 2 0 0 1-3.46 0\"/></svg>",
-	"description": "任务完成 / 需要决策 / 出错时推送到 Bark；声音即优先级，点击推送可回到会话或一键确认。",
-	"descriptionEn": "Pushes to Bark when a run finishes, needs your decision, or dies. Sound encodes priority; tapping a push returns to the conversation or acks it.",
+	"description": "任务完成 / 出错时推送到 Bark；声音即优先级，点击推送可回到 cockpit。",
+	"descriptionEn": "Pushes to Bark when a run finishes or dies. Sound encodes priority; tapping a push returns to the cockpit.",
 	"homepage": "https://github.com/onjim/bark-notify",
 	"apiVersion": 2,
 	"view": false,
@@ -22,6 +22,7 @@
 	],
 	"netAllowlist": [
 		"api.day.app",
+		"example.com",
 		"github.com",
 		"avatars.githubusercontent.com"
 	],
@@ -54,10 +55,10 @@
 			"labelEn": "Notify level",
 			"default": "important",
 			"options": [
-				{ "value": "all", "label": "完成 + 决策 + 出错（默认过滤秒回）", "labelEn": "Completion + decisions + errors (fast runs filtered)" },
-				{ "value": "important", "label": "只推：需决策 + 出错", "labelEn": "Only decisions + failures" },
-				{ "value": "silent", "label": "全静音（只记站内）", "labelEn": "Silent (in-app log only)" }
-			]
+				{ "value": "all", "label": "全部：完成 + 出错", "labelEn": "All: completions + errors" },
+				{ "value": "important", "label": "只推出错（默认）", "labelEn": "Errors only (default)" }
+			],
+			"hint": "自动事件按档处理：出错/中断任何档都推且不受时长限制；「完成」仅【全部】档推，且另受下方「最短运行时长」过滤（秒回不打扰）。以下属强制通道，不受档位限制：上线回执、设置页自检 /test、外部 /send 与 bark_notify 工具推送。"
 		},
 		{
 			"key": "minRunMinutes",
@@ -67,7 +68,7 @@
 			"default": 5,
 			"min": 0,
 			"max": 10,
-			"hint": "仅正常完成的任务运行超过此时长才推送；默认 5 分钟，0 = 不限制。开始不推送，出错和需要决策仍及时推送。"
+			"hint": "仅正常完成的任务运行超过此时长才推送；默认 5 分钟，0 = 不限制。开始不推送，出错仍及时推送。"
 		},
 		{
 			"key": "dedupSec",
@@ -84,14 +85,6 @@
 			"label": "通知图标 URL（默认空）",
 			"labelEn": "Icon URL (empty by default)",
 			"hint": "默认留空 = 用 Bark App 自己的默认图标。想固定换图再填：≥150×150 PNG，否则 critical 级的附件图会被 APNs 丢。"
-		},
-		{
-			"key": "morningCron",
-			"type": "text",
-			"label": "晨报 cron（留空关闭）",
-			"labelEn": "Morning report cron (empty = off)",
-			"default": "",
-			"hint": "例：0 8 * * * （每天 08:00）。"
 		}
 	]
 }

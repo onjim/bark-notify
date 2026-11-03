@@ -1,7 +1,7 @@
 # bark-notify 🔔 — 任务事件推到 Bark
 
-> 声音即优先级：完成 `glass` · 要你决策 `cicada` · 出错 `crow`+`critical`（可穿透静音/专注模式）。
-> 点推送可回 cockpit 或一键标记「已看到」。
+> 声音即优先级：完成 `glass` · 出错 `crow`+`critical`（可穿透静音/专注模式）。
+> 点推送可回 cockpit。
 
 ## 为什么是 plugin 而不是裸 extension
 
@@ -9,8 +9,7 @@
 |---|---|---|
 | 一条命令装到别的实例 | ✅ `pi-web-ui install` | ❌ 手动拷 |
 | 密钥存放 | ✅ 设置项 `secret` 类型 → 进 secrets，不进 git | 只能 env/硬编码 |
-| 点推送回环 | ✅ `route` → `/plugins-api/bark-notify/ack` | 无 HTTP 面 |
-| 推送档位 / 定时晨报 | ✅ 插件设置 + `schedule` | 无 |
+| 推送档位 | ✅ 插件设置 | 无 |
 
 ## 安装
 
@@ -66,7 +65,7 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
 
 两条路都没走通也不会让你闷在鼓里：插件会当场点名「「bark.example.com」尚未获准出站」。
 
-可选：推送档位（完成+决策+出错 / 只推决策+出错 / 全静音）、完成通知最短运行时长（默认 5 分钟）、去重窗口、图标 URL（**默认空**）、晨报 cron。所谓「全推」也不是字面全推：`turn_end`/`tool_delta` 等高频事件任何档位都不推；「完成」还受最短运行时长过滤（设 0 = 不限）。
+可选：推送档位（全部：完成+出错 / 只推出错（默认））、完成通知最短运行时长（默认 5 分钟）、去重窗口、图标 URL（**默认空**）。档位只管自动事件：出错任何档都推且不受时长限制；「完成」仅「全部」档推，另受最短运行时长过滤（设 0 = 不限）。上线回执、自检 /test、外部 /send 与 bark_notify 工具推送属强制通道，不受档位限制。
 
 ## 事件 → 通知映射
 
@@ -75,8 +74,6 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
 | `run_end`（正常 stopReason） | `✅ <项目> · 任务完成` | `glass` / active | 运行超过「最短运行时长」才推，默认 5 分钟；未捕获开始事件时不推 |
 | `run_end`（`length`/`content_filter`） | `⚠️ <项目> · 提前收尾` | `bell` / timeSensitive | 提示要续一句 |
 | `run_end`（`error`/`aborted`/`timeout`…） | `❌ <项目> · 中断` | `crow` / **critical** | 穿透静音 |
-| `tool_approval_pending` | `🙋 等批准 · <项目>` | `cicada` / timeSensitive | 点推送 = `/ack` 记一笔 |
-| `question_pending` | `🙋 需要你回答 · <项目>` | `cicada` / timeSensitive | 直达会话 |
 | `run_start` | — | — | 只记录开始时间，不发送通知 |
 | `turn_end` / `tool_delta` / … | — | 不推 | 防刷屏 |
 
@@ -89,7 +86,7 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
     -H 'Content-Type: application/json' \
     -d '{"title":"✅ 备份完成","body":"NAS 3.2TB · 41s","level":"active"}'
   ```
-- 其它端点：`GET /plugins-api/bark-notify/ping`（配置摘要，含是否已填 key）、`GET /status`（最近 20 条投递）、`GET /ack?t=<id>`（手机点推送后的极简确认页）。
+- 其它端点：`GET /plugins-api/bark-notify/ping`（配置摘要，含是否已填 key）、`GET /status`（最近 20 条投递）。
 
 ## 三个踩过的坑（写死在实现里）
 

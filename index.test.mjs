@@ -5,7 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import plugin, { classifyEvent, buildPayload, dedupeKey, pickProject } from "./index.mjs";
+import plugin, { classifyEvent, buildPayload, dedupeKey, pickProject, numSet } from "./index.mjs";
 import { createMockHost } from "./sdk/index.mjs";
 
 describe("classifyEvent", () => {
@@ -31,16 +31,8 @@ describe("classifyEvent", () => {
 		assert.equal(note.level, "timeSensitive");
 	});
 
-	it("等批准 → ask 且带 ack 回环", () => {
-		const note = classifyEvent({ type: "tool_approval_pending", command: "rm -rf dist", conversationId: "conv-9999ff00" }, { project: "web" });
-		assert.equal(note.kind, "ask");
-		assert.match(note.title, /🙋 等批准 · web/);
-		assert.match(note.body, /rm -rf dist/);
-		assert.ok(note.ack);
-	});
-
 	it("噪声事件一律不推（防刷屏）", () => {
-		for (const type of ["turn_end", "turn_start", "tool_delta", "tool_info", "run_start", "unknown_kind"]) {
+		for (const type of ["turn_end", "turn_start", "tool_delta", "tool_info", "run_start", "tool_approval_pending", "question_pending", "unknown_kind"]) {
 			assert.equal(classifyEvent({ type }, {}), null, type);
 		}
 		assert.equal(classifyEvent(null, {}), null);
@@ -84,7 +76,7 @@ describe("buildPayload", () => {
 });
 
 describe("activate（mock host）", () => {
-	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", minRunMinutes: 0, dedupSec: 0, icon: "https://x/i.png", morningCron: "" };
+	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", minRunMinutes: 0, dedupSec: 0, icon: "https://x/i.png" };
 
 	const requestTest = (host, headers = { "content-type": "application/json" }) => new Promise((resolve) => {
 		const route = host.mock.routes.find((r) => (r.path || r[1]) === "/test");
@@ -116,13 +108,13 @@ describe("activate（mock host）", () => {
 			"应注册 bark_notify 工具（真宿主走 registerAgentTool）",
 		);
 		const routes = calls.filter((c) => c.method === "route").map((c) => c.args[1]);
-		for (const p of ["/ping", "/status", "/send", "/ack"]) assert.ok(routes.includes(p), `缺路由 ${p}`);
+		for (const p of ["/ping", "/status", "/send"]) assert.ok(routes.includes(p), `缺路由 ${p}`);
 	});
 
 	it("不限时长时完成事件真投递到 /push", async () => {
 		const host = createMockHost({ settings });
 		const fetches = [];
-		host.fetch = async (url, init) => {
+		host.net.fetch = async (url, init) => {
 			fetches.push({ url, init });
 			return { status: 200, text: async () => '{"code":200,"message":"success"}' };
 		};
@@ -137,27 +129,23 @@ describe("activate（mock host）", () => {
 		assert.match(body.title, /✅ pi · 任务完成/);
 	});
 
-	it("silent 档位一律不外发", async () => {
+	it("旧版残留 silent 值降级为只推出错：完成不推、出错照推", async () => {
 		const host = createMockHost({ settings: { ...settings, mode: "silent" } });
-		host.storage.set("boot:lastPing", Date.now()); // 胉眼：上线回执是 force 推送，会绕过 silent
+		host.storage.set("boot:lastPing", Date.now());
 		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
-		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "conv-2", at: Date.now() });
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "end_turn", conversationId: "old-silent-done", at: Date.now() });
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "old-silent-fail", at: Date.now() });
 		await new Promise((r) => setTimeout(r, 30));
-		assert.equal(fetches.length, 0);
-	});
-
-	it("morningCron 非空则挂定时任务", async () => {
-		const host = createMockHost({ settings: { ...settings, morningCron: "0 8 * * *" } });
-		await plugin.activate(host);
-		assert.ok(host.mock.schedules.length >= 1, "应挂上晨报定时任务");
+		assert.equal(fetches.length, 1, "完成不应推，出错应推");
+		assert.match(JSON.parse(fetches[0].init.body).title, /中断/);
 	});
 
 	it("首次加载会推一条上线回执（含能力自检结果）", async () => {
 		const host = createMockHost({ settings });
 		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
 		await new Promise((r) => setTimeout(r, 30));
 		assert.equal(fetches.length, 1, "应有一条上线回执");
@@ -170,7 +158,7 @@ describe("activate（mock host）", () => {
 		const host = createMockHost({ settings });
 		host.storage.set("boot:lastPing", Date.now());
 		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
 		await new Promise((r) => setTimeout(r, 30));
 		assert.equal(fetches.length, 0);
@@ -180,7 +168,7 @@ describe("activate（mock host）", () => {
 		for (const miss of ["server", "barkKey"]) {
 			const host = createMockHost({ settings: { ...settings, [miss]: "" } });
 			const fetches = [];
-			host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+			host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 			await plugin.activate(host);
 			host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: `c-${miss}`, at: Date.now() });
 			await new Promise((r) => setTimeout(r, 30));
@@ -199,7 +187,7 @@ describe("activate（mock host）", () => {
 			const host = createMockHost({ settings: { ...settings, webBase } });
 			host.storage.set("boot:lastPing", Date.now());
 			const fetches = [];
-			host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+			host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 			await plugin.activate(host);
 			host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "optional-url", at: Date.now() });
 			await new Promise((r) => setTimeout(r, 30));
@@ -235,7 +223,7 @@ describe("activate（mock host）", () => {
 			requestPermission: async () => true,
 		});
 		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
 		await new Promise((r) => setTimeout(r, 30));
 		assert.ok(fetches.length >= 1, "批准后应能真的发出去");
@@ -248,7 +236,7 @@ describe("activate（mock host）", () => {
 
 	it("默认 api.day.app 无需申请授权", async () => {
 		const host = createMockHost({ settings: { ...settings, server: "https://api.day.app" } });
-		host.fetch = async () => ({ status: 200, text: async () => '{"code":200}' });
+		host.net.fetch = async () => ({ status: 200, text: async () => '{"code":200}' });
 		await plugin.activate(host);
 		assert.equal(host.mock.calls("requestPermission").length, 0);
 	});
@@ -259,7 +247,7 @@ describe("activate（mock host）", () => {
 		const host = createMockHost({ settings: { ...settings, minRunMinutes: 5 } });
 		host.storage.set("boot:lastPing", now);
 		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
 		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "short" });
 		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "long" });
@@ -281,7 +269,7 @@ describe("activate（mock host）", () => {
 		const host = createMockHost({ settings: { ...settings, minRunMinutes: 5 } });
 		host.storage.set("boot:lastPing", Date.now());
 		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
 		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "failed" });
 		host.mock.emit("onRunEvent", { type: "run_end", conversationId: "failed", stopReason: "error" });
@@ -322,14 +310,14 @@ describe("activate（mock host）", () => {
 		assert.ok(host.mock.calls("notify").some((c) => c.args[0] === "warning"));
 	});
 
-	it("保存配置后下一次推送使用新设置并重挂晨报", async () => {
+	it("保存配置后下一次推送使用新设置", async () => {
 		const host = createMockHost({ settings: { ...settings } });
 		host.storage.set("boot:lastPing", Date.now());
 		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
 		host.secrets.set("setting:barkKey", "NEW_KEY");
-		host.mock.emitSettings({ server: "https://api.day.app", webBase: "", mode: "all", icon: "https://example.com/new.png", morningCron: "0 9 * * *" });
+		host.mock.emitSettings({ server: "https://api.day.app", webBase: "", mode: "all", icon: "https://example.com/new.png" });
 		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "updated", at: Date.now() });
 		await new Promise((r) => setTimeout(r, 30));
 		assert.equal(fetches.length, 1);
@@ -338,15 +326,14 @@ describe("activate（mock host）", () => {
 		assert.equal(payload.device_key, "NEW_KEY");
 		assert.equal(payload.icon, "https://example.com/new.png");
 		assert.equal("url" in payload, false);
-		assert.equal(host.mock.schedules[0].spec, "0 9 * * *");
 	});
 
 	it("手动测试可重试拒绝的授权，不泄露返回正文并绕过去重", async () => {
 		let granted = false;
-		const host = createMockHost({ settings: { ...settings, server: "https://new.example.net", mode: "silent", dedupSec: 300 }, requestPermission: async () => granted });
+		const host = createMockHost({ settings: { ...settings, server: "https://new.example.net", mode: "important", dedupSec: 300 }, requestPermission: async () => granted });
 		host.storage.set("boot:lastPing", Date.now());
 		let sent = 0;
-		host.fetch = async () => { sent++; return { status: 200, text: async () => '{"code":200,"secret":"DO_NOT_RETURN"}' }; };
+		host.net.fetch = async () => { sent++; return { status: 200, text: async () => '{"code":200,"secret":"DO_NOT_RETURN"}' }; };
 		await plugin.activate(host);
 		assert.equal((await requestTest(host, {})).status, 415);
 		granted = true;
@@ -363,7 +350,7 @@ describe("activate（mock host）", () => {
 		const host = createMockHost({ settings: { ...settings }, requestPermission: () => new Promise((resolve) => { resolveGrant = resolve; }) });
 		host.storage.set("boot:lastPing", Date.now());
 		let sent = 0;
-		host.fetch = async () => { sent++; return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async () => { sent++; return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
 		host.mock.emitSettings({ server: "https://new.example.net" });
 		const first = requestTest(host);
@@ -409,7 +396,7 @@ describe("项目名提取", () => {
 		host.storage.set("boot:lastPing", Date.now());
 		host.getActiveConversation = () => ({ cwd: "", title: "https://bark.day.app/#/params?id=x" });
 		const fetches = [];
-		host.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
 		await plugin.activate(host);
 		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "end_turn", conversationId: "c-url", at: Date.now() });
 		await new Promise((r) => setTimeout(r, 30));
@@ -417,6 +404,49 @@ describe("项目名提取", () => {
 		const body = JSON.parse(fetches[0].init.body);
 		assert.equal(body.title, "✅ pi · 任务完成");
 		assert.equal(/https?:/.test(body.title), false);
+	});
+});
+
+describe("numSet 与失败重试（review 补盖）", () => {
+	it("数字设置：空串/非法回默认，0 = 显式不限", () => {
+		assert.equal(numSet("", 300), 300);
+		assert.equal(numSet("  ", 300), 300);
+		assert.equal(numSet("abc", 300), 300);
+		assert.equal(numSet("0", 300), 0);
+		assert.equal(numSet("60", 300), 60);
+	});
+
+	it("投递失败释放去重标记：同内容可重试；成功送达才占窗口", async () => {
+		const s = { server: "https://example.com", barkKey: "MOCK", webBase: "", mode: "all", minRunMinutes: 0, dedupSec: 300, icon: "" };
+		const host = createMockHost({ settings: s });
+		host.storage.set("boot:lastPing", Date.now());
+		const fetches = [];
+		let gatewayDown = true;
+		host.net.fetch = async (url, init) => {
+			fetches.push({ url, init });
+			return gatewayDown
+				? { status: 500, text: async () => "gateway hiccup" }
+				: { status: 200, text: async () => '{"code":200}' };
+		};
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "retry-1", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(fetches.length, 1, "首次尝试应发出（随后 500）");
+		gatewayDown = false;
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "retry-1", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(fetches.length, 2, "失败已释放去重标记，同事件应重试");
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "retry-1", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(fetches.length, 2, "成功送达后同内容应被去重");
+	});
+
+	it("授权弹框挂住不拖 activate：boot 不再阻塞路由/事件接入", async () => {
+		const s = { server: "https://bark.mine.test", barkKey: "MOCK", webBase: "", mode: "all", minRunMinutes: 0, dedupSec: 300, icon: "" };
+		const host = createMockHost({ settings: s, requestPermission: () => new Promise(() => {}) }); // 永不回：模拟用户不在 120s 内点
+		const t0 = Date.now();
+		await plugin.activate(host);
+		assert.ok(Date.now() - t0 < 50, "activate 应立即完成，不等授权结果");
 	});
 });
 });

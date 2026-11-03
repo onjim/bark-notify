@@ -1,14 +1,14 @@
 /**
  * bark-notify — 任务事件 → Bark 推送（服务端入口）
  *
- * 只做三件事：
- *   1. 分级：把宿主 run/tool 事件映射成 done / ask / fail / start 四档，声音即优先级
- *      （glass=完成 · cicada=要你决策 · crow+critical=出错 · silence=只记账）。
+ * 只做两件事：
+ *   1. 分级：把宿主 run 事件映射成 done / fail 两档，声音即优先级
+ *      （glass=完成 · crow+critical=出错）。
  *   2. 投递：POST <server>/push + snake_case `device_key`。中文/emoji/换行原生支持，
  *      不需要 URL 编码 —— 这类精简版 bark-server 的 GET 路径式虽返 200，但走
  *      jq '@uri' 拼 URL 时非 ASCII 会变成字面量 "null"（踩过），故统一走 POST。
- *   3. 回环：GET /plugins-api/bark-notify/ack?t=<id> —— 手机上点一下推送即视为确认，
- *      这是单向 APNs 通道里唯一能形成的反馈闭环（返回极简 HTML，不留 JSON 白页）。
+ * （原「需要你决策」档与 /ack 回环已删：当前宿主的 approval/question 消息只走
+ *   客户端 WS 桥，不进插件可见的 onRunEvent，无法可靠触发。）
  */
 import { definePlugin } from "./sdk/index.mjs";
 
@@ -39,6 +39,13 @@ const clip = (value, max) => {
 	const text = String(value ?? "").replace(/[ \t]+\n/g, "\n").trim();
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 };
+/** 数字设置取值：空串/非法 → 默认值；0 是显式合法值（如「不限时长」），与清空区分。 */
+export function numSet(value, dflt) {
+	const t = String(value ?? "").trim();
+	if (t === "") return dflt;
+	const n = Number(t);
+	return Number.isFinite(n) ? n : dflt;
+}
 const shortId = (value) => String(value ?? "").replace(/[^0-9a-zA-Z]/g, "").slice(0, 8) || "unknown";
 const baseName = (pathLike) => String(pathLike ?? "").replace(/[/\\]+$/, "").split(/[/\\]/).pop() || "";
 const fmtDur = (ms) => {
@@ -63,7 +70,6 @@ export function classifyEvent(ev, ctx = {}) {
 	const proj = ctx.project || "pi";
 	const dur = fmtDur(ctx.durationMs);
 	const tail = [dur && `耗时 ${dur}`, ctx.convId && `会话 ${ctx.convId}`].filter(Boolean).join(" · ");
-	const id = shortId(ctx.convId || ev.conversationId || ev.sessionId);
 
 	switch (ev.type) {
 		// run_start 不生成通知：handleEvent 只记开始时间用于「最短运行时长」判断
@@ -90,26 +96,6 @@ export function classifyEvent(ev, ctx = {}) {
 				title: clip(`✅ ${proj} · 任务完成`, SHORT_TITLE),
 				body: clip([dur || "已完成", tail && tail.replace(/ · /g, "\n")].filter(Boolean).join("\n"), SHORT_BODY),
 				sound: "glass", level: "active", archived: false, badge: 1,
-			};
-		}
-		case "tool_approval_pending": {
-			const cmd = clip(ev.command ?? ev.toolName ?? ev.name ?? "命令", 120);
-			return {
-				kind: "ask",
-				title: clip(`🙋 等批准 · ${proj}`, SHORT_TITLE),
-				body: clip(`${cmd}\n${[dur && `已等 ${dur}`, "点这条推送 = 标记已看到"].filter(Boolean).join("\n")}`, SHORT_BODY),
-				sound: "cicada", level: "timeSensitive", archived: false, badge: 1,
-				ack: id,
-			};
-		}
-		case "question_pending": {
-			const q = clip(ev.question ?? ev.text ?? "AI 在等你回答", 160);
-			return {
-				kind: "ask",
-				title: clip(`🙋 需要你回答 · ${proj}`, SHORT_TITLE),
-				body: clip(`${q}\n${[dur && `已等 ${dur}`, "点推送直达会话选项"].filter(Boolean).join("\n")}`, SHORT_BODY),
-				sound: "cicada", level: "timeSensitive", archived: false, badge: 1,
-				ack: id,
 			};
 		}
 		case "run_error":
@@ -157,7 +143,6 @@ export default definePlugin({
 		const startedAt = new Map();          // conversationId → run 起始 ms
 		const dedup = new Map();             // hash → 最近投递 ms
 		const recent = [];                  // 最近 20 条投递记录（/status 用）
-		let morningStop = null;
 
 		const cfgOf = () => {
 			const s = host.getSettings() || {};
@@ -172,10 +157,9 @@ export default definePlugin({
 				barkKey: secret("barkKey"),
 				webBase: clean(s.webBase),
 				icon: clean(s.icon),
-				mode: s.mode || "important",
-				minRunMs: Number(s.minRunMinutes ?? 5) * 60_000,
-				dedupSec: Number(s.dedupSec ?? 300),
-				morningCron: String(s.morningCron ?? "").trim(),
+				mode: s.mode === "all" ? "all" : "important", // 旧版残留的 silent 值收敛到只推出错，不会升级后变全推
+				minRunMs: numSet(s.minRunMinutes, 5) * 60_000, // 清空回默认 5 分钟，0 = 不限
+				dedupSec: numSet(s.dedupSec, 300),
 			};
 		};
 		/** 缺必填项 / 域名不在出站白名单：两条都让人当场看到，而不是默默不发 */
@@ -226,7 +210,7 @@ export default definePlugin({
 		const pushUrlOf = (cfg, note) => {
 			if (!cfg.webBase) return "";
 			// 同域相对路径自然继承反代域名，端口问题不存在（别写 :8787）
-			return note.ack ? `${cfg.webBase}/plugins-api/bark-notify/ack?t=${encodeURIComponent(note.ack)}` : `${cfg.webBase}/`;
+			return `${cfg.webBase}/`;
 		};
 
 		const sendJson = (res, status, payload) => {
@@ -244,20 +228,21 @@ export default definePlugin({
 			if (!note) return { ok: false, skipped: "no-note" };
 			const cfg = cfgOf();
 			const mode = cfg.mode;
-			if (mode === "silent" && !opts.force) { record({ ...note, result: "muted" }); return { ok: false, skipped: "mode-silent" }; }
+			const k = dedupeKey(note);
+			const rec = (n, result, extra) => record({ kind: n.kind, title: n.title, result, ...extra });
+			const release = () => dedup.delete(k); // 试了但没送达 → 释放去重标记，不吞重试机会
 			if (mode === "important" && !opts.force && note.kind === "done") {
-				record({ ...note, result: "filtered" });
+				rec(note, "filtered");
 				return { ok: false, skipped: "mode-important" };
 			}
 			if (note.kind === "done" && !opts.force && cfg.minRunMs > 0 && (!Number.isFinite(opts.durationMs) || opts.durationMs <= cfg.minRunMs)) {
 				return { ok: false, skipped: "too-fast" };
 			}
 			// 秒级去重
-			const k = dedupeKey(note);
 			const now = Date.now();
 			if (cfg.dedupSec > 0 && !opts.bypassDedup) {
 				const prev = dedup.get(k);
-				if (prev && now - prev < cfg.dedupSec * 1000) { record({ ...note, result: "dedup" }); return { ok: false, skipped: "dedup" }; }
+				if (prev && now - prev < cfg.dedupSec * 1000) { rec(note, "dedup"); return { ok: false, skipped: "dedup" }; }
 				dedup.set(k, now);
 				if (dedup.size > 500) for (const [hk, hv] of dedup) { if (now - hv > cfg.dedupSec * 1000) dedup.delete(hk); }
 			}
@@ -266,11 +251,13 @@ export default definePlugin({
 				const allowProblem = allowHint(cfg.server);
 				if (allowProblem) {
 					host.log("warn", allowProblem);
-					record({ ...note, result: "not-allowlisted" });
+					rec(note, "not-allowlisted");
+					release();
 					return { ok: false, skipped: "not-allowlisted", hint: allowProblem };
 				}
 			}
 			if (opts.retryAuthorization && (cfgOf().server !== cfg.server || cfgOf().barkKey !== cfg.barkKey)) {
+				release();
 				return { ok: false, skipped: "configuration-changed" };
 			}
 			const missing = missingCfg();
@@ -278,37 +265,53 @@ export default definePlugin({
 				const tip = `Bark 推送未配置：请填写 ${missing.join(" / ")}（设置 → 界面插件 → Bark 推送）`;
 				host.notify("warning", tip, `Bark not configured: fill ${missing.join(" / ")}`);
 				host.log("warn", tip);
-				record({ ...note, result: "unconfigured" });
+				rec(note, "unconfigured");
+				release();
 				return { ok: false, skipped: "unconfigured", missing };
 			}
 			const payload = buildPayload(cfg, { ...note, url: note.url || pushUrlOf(cfg, note) });
-			if (!payload) { host.log("warn", "barkKey 未配置（设置 → Bark 推送 → 设备密钥）"); return { ok: false, skipped: "no-key" }; }
+			if (!payload) { host.log("warn", "barkKey 未配置（设置 → Bark 推送 → 设备密钥）"); release(); return { ok: false, skipped: "no-key" }; }
 			try {
-				const res = await host.fetch(`${cfg.server}/push`, {
+				// 走宿主受控出站 net.fetch（白名单/已授权威才放行）；旧宿主无 net 时退回裸 fetch
+				const viaNet = typeof host.net?.fetch === "function";
+				const res = await (viaNet ? host.net.fetch : host.fetch).call(viaNet ? host.net : host, `${cfg.server}/push`, {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify(payload),
 					timeoutMs: 15000,
 				});
-				const text = await res.text().catch(() => "");
-				const ok = res.status === 200 && /"code"\s*:\s*200/.test(text);
-				record({ kind: note.kind, title: note.title, result: ok ? "sent" : `http-${res.status}`, detail: clip(text, 160) });
+				// net.fetch 被拒时回 {ok:false,error:…}（无 status/text）；放行后才是 HTTP 响应形状
+				const status = Number.isFinite(res?.status) ? res.status : 0;
+				const text = typeof res?.text === "function" ? await res.text().catch(() => "") : String(res?.error ?? res?.message ?? "");
+				const ok = status === 200 && /"code"\s*:\s*"?200"?/.test(text); // 兼容字符串 "200"（部分自架 server）
+				rec(note, ok ? "sent" : status ? `http-${status}` : "net-denied", { detail: clip(text, 160) });
 				host.log(ok ? "info" : "warn", `bark ${ok ? "ok" : "FAILED"} [${note.kind}|${payload.sound}|${payload.level}] ${note.title} ${ok ? "" : text.slice(0, 160)}`);
-				return { ok, status: res.status, text: clip(text, 200) };
+				if (!ok) release();
+				return { ok, status, text: clip(text, 200) };
 			} catch (err) {
-				record({ kind: note.kind, title: note.title, result: "error", detail: String(err?.message || err).slice(0, 160) });
+				rec(note, "error", { detail: String(err?.message || err).slice(0, 160) });
 				host.log("error", `bark 投递异常: ${String(err?.message || err).slice(0, 200)}`);
+				release();
 				return { ok: false, error: String(err?.message || err) };
 			}
 		}
 
-		/** 事件入口：算耗时 → 分级 → 投递。 */
-		async function handleEvent(ev, source = "run") {
-			if (!ev || typeof ev !== "object") return;
+		/** 事件入口：类型门 → 算耗时 → 取快照 → 分级 → 投递。门在前，高频事件（turn、tool、message 系列）不再白拉会话快照。 */
+		const NOTIFIABLE = new Set(["run_end", "run_error", "agent_error"]);
+		async function handleEvent(ev) {
+			if (!ev || typeof ev !== "object" || typeof ev.type !== "string") return;
 			const cid = ev.conversationId || ev.sessionId || ev.clientId || "anon";
-			if (ev.type === "run_start") { startedAt.set(cid, Date.now()); return; }
+			if (ev.type === "run_start") {
+				startedAt.set(cid, Date.now());
+				if (startedAt.size > 200) { // 清遗忘键（run 未正常收尾）：只留近 24h
+					const cut = Date.now() - 24 * 3600 * 1000;
+					for (const [kc, vc] of startedAt) { if (vc < cut) startedAt.delete(kc); }
+				}
+				return;
+			}
+			if (!NOTIFIABLE.has(ev.type)) return;
 			let durationMs;
-			if (ev.type === "run_end" || ev.type === "run_error" || ev.type === "agent_error") {
+			{
 				const t0 = startedAt.get(cid);
 				startedAt.delete(cid);
 				if (t0 !== undefined) durationMs = Math.max(0, Date.now() - t0);
@@ -324,12 +327,12 @@ export default definePlugin({
 				convId: shortId(cid),
 			});
 			if (!note) return;
-			note.group = note.kind === "ask" ? "pi-ask" : note.kind === "fail" ? "pi-fail" : source === "tool" ? "pi-tool" : "pi";
+			note.group = note.kind === "fail" ? "pi-fail" : "pi";
 			await notify(note, { durationMs });
 		}
 
-		const offRun = host.onRunEvent((ev) => { handleEvent(ev, "run").catch((err) => host.log("error", String(err?.message || err))); });
-		const offTool = host.onToolEvent?.((ev) => { handleEvent(ev, "tool").catch(() => {}); });
+		// 只订阅 onRunEvent：宿主 onToolEvent 载荷无 type 字段（phase/toolName 那套），永不产出通知，订了白烧 CPU
+		const offRun = host.onRunEvent((ev) => { handleEvent(ev).catch((err) => host.log("error", String(err?.message || err))); });
 
 		const curMode = () => cfgOf().mode;
 
@@ -350,7 +353,7 @@ export default definePlugin({
 		probe("tools", () => (typeof (host.registerAgentTool ?? host.registerTool) === "function" ? "ok" : "missing"));
 		probe("http", () => (typeof host.route === "function" ? "ok" : "missing"));
 		probe("schedule", () => (typeof host.schedule === "function" ? "ok" : "missing（无能力族，靠自然可用）"));
-		probe("net", () => (typeof host.fetch === "function" ? "ok" : "missing"));
+		probe("net", () => (typeof host.net?.fetch === "function" || typeof host.fetch === "function" ? "ok" : "missing"));
 		probe("ui", () => (typeof host.ui === "object" ? "ok" : "missing"));
 		const capsBlocked = Object.entries(caps).filter(([, v]) => v !== "ok");
 
@@ -369,7 +372,20 @@ export default definePlugin({
 		/** 外部推一条：共用插件里的配置（脚本/其它机器不用各自存 key）。
 		 *  三种进数据都要接：宿主 json parser 已把 body 消耗成 req.body（主流情况）、
 		 *  原始流（未接 parser 时）、以及 GET query（手机上直接输 URL 就能测）。 */
-		const deliver = async (body, res) => {
+		/** 外部推送简易限流：每 IP 每 10 分钟 ≤30 条。 */
+		const extSends = new Map(); // ip → [ms,...]
+		const rateOk = (req) => {
+			const ip = String(req?.socket?.remoteAddress || req?.ip || "unknown");
+			const now = Date.now(); const win = now - 10 * 60 * 1000;
+			const arr = (extSends.get(ip) || []).filter((t) => t > win);
+			extSends.set(ip, arr);
+			if (extSends.size > 64) { for (const [ki, va] of extSends) { if (!va.some((t) => t > win)) extSends.delete(ki); } }
+			if (arr.length >= 30) return false;
+			arr.push(now);
+			return true;
+		};
+		const deliver = async (body, res, req) => {
+			if (!rateOk(req)) return sendJson(res, 429, { ok: false, error: "外部推送限流：每 10 分钟≤ 30 条" });
 			const iconOverride = String(body.icon ?? "").trim() || undefined;
 			const out = await notify({
 				kind: body.kind || "done",
@@ -388,23 +404,24 @@ export default definePlugin({
 			return out;
 		};
 		host.route("POST", "/send", (req, res) => {
-			if (req?.body && typeof req.body === "object") return void deliver(req.body, res);
+			if (req?.body && typeof req.body === "object") return void deliver(req.body, res, req);
 			if (typeof req?.on !== "function") return sendJson(res, 400, { ok: false, error: "读不到请求体（宿主既未交 req.body 也未交流）" });
 			let raw = "";
-			req.on("data", (c) => { raw += c; });
+			let answered = false;
+			req.on("data", (c) => {
+				raw += c;
+				if (raw.length > 65536 && !answered) { answered = true; sendJson(res, 413, { ok: false, error: "请求体过大（>64KB）" }); try { req.destroy?.(); } catch {} }
+			});
 			req.on("end", () => {
+				if (answered) return;
+				answered = true;
 				let body = {};
 				try { body = JSON.parse(raw || "{}"); } catch { return sendJson(res, 400, { ok: false, error: "bad json" }); }
-				void deliver(body, res);
+				void deliver(body, res, req);
 			});
+			req.on("error", () => { answered = true; });
 		});
-		host.route("GET", "/send", (req, res) => void deliver(queryBody(req), res));
-		host.route("GET", "/ack", (req, res) => {
-			const t = String(req.url || "").match(/[?&]t=([^&]+)/)?.[1] || "";
-			host.storage.set(`ack:${t}`, Date.now());
-			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-			res.end(`<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>已确认</title><body style="font:16px/1.6 -apple-system,sans-serif;background:#111;color:#eee;display:grid;place-items:center;height:100vh;margin:0"><div style="text-align:center"><div style="font-size:44px">✅</div><p>已标记看到${t ? ` <code style="opacity:.6">${decodeURIComponent(t)}</code>` : ""}</p><p><a href="${cfgOf().webBase || "/"}" style="color:#7fd1ff">回到 cockpit</a></p></div>`);
-		});
+		host.route("GET", "/send", (req, res) => void deliver(queryBody(req), res, req));
 
 		/** —— AI 可用的工具 + 斜杠命令 —— */
 		const toolDef = {
@@ -446,22 +463,6 @@ export default definePlugin({
 		const regToolFn = typeof host.registerAgentTool === "function" ? host.registerAgentTool : host.registerTool;
 		const offToolReg = typeof regToolFn === "function" ? regToolFn.call(host, toolDef) : undefined;
 		if (regToolFn === undefined) host.log("warn", "宿主无 registerAgentTool/registerTool，AI 推送工具未注册");
-		/** —— 晨报定时任务（cron 空 = 关闭；设置改动后重挂）—— */
-		function remountMorning() {
-			try { morningStop?.(); } catch {}
-			morningStop = null;
-			const cron = cfgOf().morningCron;
-			if (!cron) return;
-			morningStop = host.schedule(cron, () => {
-				const fails = recent.filter((r) => r.result === "sent" && r.kind === "fail").length;
-				notify({
-					kind: "done", title: `🌅 晨报 · ${new Date().toLocaleDateString("zh-CN")}`,
-					body: `昨日站内事件 ${recent.length} 条，其中投递失败/中断 ${fails} 条\n档位 ${curMode()} · 点击回 cockpit`,
-					sound: "glass", level: "active", group: "pi", badge: recent.length,
-				}, { force: true });
-			}, { id: "bark-notify-morning", label: "Bark 晨报", persistent: true, catchUp: "skip" });
-		}
-		remountMorning();
 		let lastServerHost = hostOf(cfgOf().server);
 		const offSettings = host.onSettingsChanged(() => {
 			const h = hostOf(cfgOf().server);
@@ -474,7 +475,6 @@ export default definePlugin({
 					else host.notify("warning", `Bark 服务器出站授权未完成，请在已授权能力中检查，或手动重试。`, "Bark network authorization is not ready.");
 				});
 			}
-			remountMorning();
 		});
 
 		const keyState = cfgOf().barkKey ? "已配" : "未配 → 设置里填设备密钥";
@@ -483,32 +483,42 @@ export default definePlugin({
 
 		/** 上线回执：加载完直接推一条到手机（胉眼节流 10 分钟）。
 		 *  用户刷新完浏览器秒知生效与否，不用开终端 curl、也不用翻宿主日志。 */
-		const bootAt = Number(host.storage.get("boot:lastPing", 0) || 0);
 		const bootMissing = missingCfg();
-		// 先申请一次（自架域名在此弹框），批下来就不算问题
-		await ensureNetGrant(cfgOf().server).catch(() => {});
-		const bootAllow = allowHint(cfgOf().server);
-		if (bootMissing.length || bootAllow) {
-			// 不齐就不推手机（推也推不出去），且不记去重时间：刷新一次提醒一次，直到填好
-			const tip = bootMissing.length ? `🔌 bark-notify 已加载，但缺必填：${bootMissing.join(" / ")}` : `🔌 bark-notify 已加载，但发不出去：${bootAllow}`;
-			host.notify("warning", tip, tip);
-			host.log("warn", tip);
-		} else if (!Number.isFinite(bootAt) || Date.now() - bootAt > 10 * 60 * 1000) {
+		const bootPing = () => {
+			const bootAt = Number(host.storage.get("boot:lastPing", 0) || 0);
+			if (Number.isFinite(bootAt) && Date.now() - bootAt <= 10 * 60 * 1000) return;
 			host.storage.set("boot:lastPing", Date.now());
 			notify({
 				kind: capsBlocked.length ? "ask" : "done",
 				title: capsBlocked.length ? `⚠️ bark-notify 已加载（${capsBlocked.length} 项能力被拒）` : `🔌 bark-notify 已加载`,
 				body: capsBlocked.length
-					? `${capsBlocked.map(([k, v]) => `${k}: ${v}`).join("\n")}\n往 manifest.permissions 补上对应能力族再重装` 
+					? `${capsBlocked.map(([ck, cv]) => `${ck}: ${cv}`).join("\n")}\n往 manifest.permissions 补上对应能力族再重装` 
 					: `能力 ${Object.keys(caps).length}/${Object.keys(caps).length} 可用 · 档位 ${curMode()}\n密钥${keyState}`,
 				sound: capsBlocked.length ? "cicada" : "glass",
 				level: "active", group: "pi", badge: 0,
 			}, { force: true }).catch(() => {});
+		};
+		if (bootMissing.length) {
+			// 缺必填不推手机（推也推不出去），且不记去重时间：刷新一次提醒一次，直到填好
+			const tip = `🔌 bark-notify 已加载，但缺必填：${bootMissing.join(" / ")}`;
+			host.notify("warning", tip, tip);
+			host.log("warn", tip);
+		} else {
+			// 不 await：授权弹框最长挂 120s，拖住 activate = 期间路由 404 + run 事件扇出不到；改异步跟进
+			void ensureNetGrant(cfgOf().server).then((ok) => {
+				const bootAllow = ok ? "" : allowHint(cfgOf().server);
+				if (bootAllow) {
+					const tip = `🔌 bark-notify 已加载，但发不出去：${bootAllow}`;
+					host.notify("warning", tip, tip);
+					host.log("warn", tip);
+					return;
+				}
+				bootPing();
+			}).catch(() => {});
 		}
 
 		return () => {
-			for (const off of [offRun, offTool, offToolReg, offSettings]) { try { off?.(); } catch {} }
-			try { morningStop?.(); } catch {}
+			for (const off of [offRun, offToolReg, offSettings]) { try { off?.(); } catch {} }
 		};
 	},
 });
