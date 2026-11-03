@@ -290,6 +290,25 @@ describe("activate（mock host）", () => {
 		assert.match(JSON.parse(fetches[0].init.body).title, /中断/);
 	});
 
+	it("未配置时只报本来真要发的事件：短完成静默丢弃，出错才报缺配置", async (t) => {
+		let now = 1_000_000;
+		t.mock.method(Date, "now", () => now);
+		const empty = { mode: "all", muteWhenActive: 0, minRunMinutes: 5, dedupSec: 0 };
+		const host = createMockHost({ settings: { ...empty } });
+		host.storage.set("boot:lastPing", now);
+		await plugin.activate(host);
+		const warnAt = host.mock.calls("notify").filter((c) => c.args[0] === "warning").length;
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "fast" });
+		now += 300000;
+		host.mock.emit("onRunEvent", { type: "run_end", conversationId: "fast", stopReason: "end_turn" });
+		await new Promise((r) => setImmediate(r));
+		assert.equal(host.mock.calls("notify").filter((c) => c.args[0] === "warning").length, warnAt, "被时长过滤的完成不该报未配置");
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "boom" });
+		host.mock.emit("onRunEvent", { type: "run_end", conversationId: "boom", stopReason: "error" });
+		await new Promise((r) => setImmediate(r));
+		assert.ok(host.mock.calls("notify").filter((c) => c.args[0] === "warning").length > warnAt, "真要发的出错应报缺配置");
+	});
+
 	it("保存新域名立即申请授权；修改密钥不重新申请", async () => {
 		const host = createMockHost({ settings: { ...settings }, requestPermission: async () => false });
 		host.storage.set("boot:lastPing", Date.now());

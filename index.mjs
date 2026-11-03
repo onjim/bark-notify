@@ -242,30 +242,11 @@ export default definePlugin({
 			if (recent.length > 20) recent.length = 20;
 		};
 
-		/** 投递一条通知（含档位过滤、前台静音、去重）。 */
+		/** 投递一条通知：先过静音/时长/去重/前台等抑制门槛，真要投递了才查配置与授权。
+		 *  顺序关键：被时长/档位过滤掉的事件本来就不会发，不该回头报「未配置」。 */
 		async function notify(note, opts = {}) {
 			if (!note) return { ok: false, skipped: "no-note" };
 			const cfg = cfgOf();
-			const missing = missingCfg();
-			if (missing.length) {
-				const tip = `Bark 推送未配置：请填写 ${missing.join(" / ")}（设置 → 界面插件 → Bark 推送）`;
-				host.notify("warning", tip, `Bark not configured: fill ${missing.join(" / ")}`);
-				host.log("warn", tip);
-				record({ ...note, result: "unconfigured" });
-				return { ok: false, skipped: "unconfigured", missing };
-			}
-			// 自架域名：先向宿主申请一次出站授权（用户点同意即记住），批不下来才算问题
-			if (!(await ensureNetGrant(cfg.server, { retry: opts.retryAuthorization }))) {
-				const allowProblem = allowHint(cfg.server);
-				if (allowProblem) {
-					host.log("warn", allowProblem);
-					record({ ...note, result: "not-allowlisted" });
-					return { ok: false, skipped: "not-allowlisted", hint: allowProblem };
-				}
-			}
-			if (opts.retryAuthorization && (cfgOf().server !== cfg.server || cfgOf().barkKey !== cfg.barkKey)) {
-				return { ok: false, skipped: "configuration-changed" };
-			}
 			const mode = cfg.mode;
 			if (mode === "silent" && !opts.force) { record({ ...note, result: "muted" }); return { ok: false, skipped: "mode-silent" }; }
 			if (mode === "important" && !opts.force && note.kind === "done") {
@@ -284,15 +265,35 @@ export default definePlugin({
 				dedup.set(k, now);
 				if (dedup.size > 500) for (const [hk, hv] of dedup) { if (now - hv > cfg.dedupSec * 1000) dedup.delete(hk); }
 			}
-			// 前台降级：你正在浏览器里操作 → 站内提示，手机不响
+			// 前台降级：你正在浏览器里操作 → 站内提示，手机不响（这条不碰 Bark，无需配置）
 			const active = cfg.muteWhenActive > 0 && lastClientActivity > 0 && now - lastClientActivity < cfg.muteWhenActive * 1000;
-			const payload = buildPayload(cfg, { ...note, url: note.url || pushUrlOf(cfg, note) });
-			if (!payload) { host.log("warn", "barkKey 未配置（设置 → Bark 推送 → 设备密钥）"); return { ok: false, skipped: "no-key" }; }
 			if (active && !opts.force) {
 				host.notify("info", `${note.title}（站内提示：手机在你操作时不响）`, note.title);
 				record({ ...note, result: "in-app" });
 				return { ok: false, skipped: "tab-active" };
 			}
+			// 到这里是真要往手机发了：自架域名先确保授权（用户点同意即记住），批不下来才算问题
+			if (!(await ensureNetGrant(cfg.server, { retry: opts.retryAuthorization }))) {
+				const allowProblem = allowHint(cfg.server);
+				if (allowProblem) {
+					host.log("warn", allowProblem);
+					record({ ...note, result: "not-allowlisted" });
+					return { ok: false, skipped: "not-allowlisted", hint: allowProblem };
+				}
+			}
+			if (opts.retryAuthorization && (cfgOf().server !== cfg.server || cfgOf().barkKey !== cfg.barkKey)) {
+				return { ok: false, skipped: "configuration-changed" };
+			}
+			const missing = missingCfg();
+			if (missing.length) {
+				const tip = `Bark 推送未配置：请填写 ${missing.join(" / ")}（设置 → 界面插件 → Bark 推送）`;
+				host.notify("warning", tip, `Bark not configured: fill ${missing.join(" / ")}`);
+				host.log("warn", tip);
+				record({ ...note, result: "unconfigured" });
+				return { ok: false, skipped: "unconfigured", missing };
+			}
+			const payload = buildPayload(cfg, { ...note, url: note.url || pushUrlOf(cfg, note) });
+			if (!payload) { host.log("warn", "barkKey 未配置（设置 → Bark 推送 → 设备密钥）"); return { ok: false, skipped: "no-key" }; }
 			try {
 				const res = await host.fetch(`${cfg.server}/push`, {
 					method: "POST",
