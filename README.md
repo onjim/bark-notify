@@ -102,10 +102,10 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
 ```bash
 node --check index.mjs                             # 语法
 node --test index.test.mjs                         # 单测（SDK 自带 createMockHost，无需起服务）
-node /usr/local/lib/node_modules/pi-web-ui/plugin-sdk/import-check.mjs .   # 客户端越界/缺失自检
+node /opt/homebrew/lib/node_modules/pi-web-ui/plugin-sdk/import-check.mjs .   # 客户端越界/缺失自检
 # manifest 权威校验（严格模式，0 error / 0 warning 才算过）
 node --input-type=module -e '
-const { validatePluginManifest } = await import("/usr/local/lib/node_modules/pi-web-ui/dist/server/plugin-manifest-validate.js");
+const { validatePluginManifest } = await import("/opt/homebrew/lib/node_modules/pi-web-ui/dist/server/plugin-manifest-validate.js");
 const fs = await import("node:fs/promises");
 const r = validatePluginManifest(JSON.parse(await fs.readFile("manifest.json", "utf8")), "bark-notify");
 console.log("strict:", r.strict, "errors:", r.errors.length, "warnings:", r.warnings.length, JSON.stringify(r.permissions));'
