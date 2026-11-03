@@ -282,9 +282,9 @@ export default definePlugin({
 					body: JSON.stringify(payload),
 					timeoutMs: 15000,
 				});
-				// net.fetch 被拒时回 {ok:false,error:…}（无 status/text）；放行后才是 HTTP 响应形状
+				// 宿主 net.fetch 回的是普通对象 {ok:true,status,text:字符串}（text 已被宿主消耗，非 Response）；被拒时回 {ok:false,error}
 				const status = Number.isFinite(res?.status) ? res.status : 0;
-				const text = typeof res?.text === "function" ? await res.text().catch(() => "") : String(res?.error ?? res?.message ?? "");
+				const text = typeof res?.text === "function" ? await res.text().catch(() => "") : String(res?.text ?? res?.error ?? res?.message ?? "");
 				const ok = status === 200 && /"code"\s*:\s*"?200"?/.test(text); // 兼容字符串 "200"（部分自架 server）
 				rec(note, ok ? "sent" : status ? `http-${status}` : "net-denied", { detail: clip(text, 160) });
 				host.log(ok ? "info" : "warn", `bark ${ok ? "ok" : "FAILED"} [${note.kind}|${payload.sound}|${payload.level}] ${note.title} ${ok ? "" : text.slice(0, 160)}`);

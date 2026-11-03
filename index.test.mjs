@@ -480,5 +480,23 @@ describe("numSet 与失败重试（review 补盖）", () => {
 		await new Promise((r) => setTimeout(r, 30));
 		assert.equal(JSON.parse(fetches[1].init.body).url, "https://cockpit.test/#s=xscript");
 	});
+
+	it("宿主 net.fetch 真实形状（{ok,status,text:字符串}）判为 sent 而非 http-200", async () => {
+		const s = { server: "https://example.com", barkKey: "MOCK", webBase: "", mode: "all", minRunMinutes: 0, dedupSec: 0, icon: "" };
+		const host = createMockHost({ settings: s });
+		host.storage.set("boot:lastPing", Date.now());
+		let hits = 0;
+		// 真宿主 pluginNetFetch：返回普通对象，text 已是字符串（无 .text() 方法）
+		host.net.fetch = async () => { hits++; return { ok: true, status: 200, text: '{"code":200,"message":"success","timestamp":1}' }; };
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "shape-1", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(hits, 1);
+		const statusRoute = host.mock.routes.find((r) => r.path === "/status");
+		let body;
+		statusRoute.handler({}, { writeHead: () => {}, end: (s2) => { body = s2; } });
+		const recent = JSON.parse(body).recent.filter((r) => r.title && /中断/.test(r.title));
+		assert.equal(recent[0].result, "sent", "普通对象响应应被判 sent（回归：旧写法 text 丢空误判 http-200）");
+	});
 });
 });
