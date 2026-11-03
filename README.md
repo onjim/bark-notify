@@ -80,12 +80,13 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
 ## AI 与你的用法
 
 - AI 侧工具 `bark_notify`：我在对话里可直接推一条（`level=critical` 穿透静音，`quiet=true` 只归档）。
-- 脚本/其它机器共用配置推送（不必各自存 key）：
+- 脚本/其它机器共用配置推送（不必各自存 key）；可选 `session` 附会话 UUID，点推送直达该会话：
   ```bash
   curl -X POST https://<cockpit域名>/plugins-api/bark-notify/send \
     -H 'Content-Type: application/json' \
-    -d '{"title":"✅ 备份完成","body":"NAS 3.2TB · 41s","level":"active"}'
+    -d '{"title":"✅ 备份完成","body":"NAS 3.2TB · 41s","level":"active","session":"01a18aa8-f143-7209-b1bb-2e84cfe8119e"}'
   ```
+- 任务事件（完成/中断）的跳转链接自动带 `#s=<会话 UUID>`（取宿主事件里的 sessionId），填了外网地址即生效；点推送直接落到干完活的那条会话。
 - 其它端点：`GET /plugins-api/bark-notify/ping`（配置摘要，含是否已填 key）、`GET /status`（最近 20 条投递）。
 
 ## 三个踩过的坑（写死在实现里）

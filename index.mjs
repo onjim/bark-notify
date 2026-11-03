@@ -209,8 +209,10 @@ export default definePlugin({
 
 		const pushUrlOf = (cfg, note) => {
 			if (!cfg.webBase) return "";
-			// 同域相对路径自然继承反代域名，端口问题不存在（别写 :8787）
-			return `${cfg.webBase}/`;
+			// 同域相对路径自然继承反代域名，端口问题不存在（别写 :8787）；
+			// 带会话 UUID 时拼 #s=<id>，点推送直达那条会话（前端 hash 路由认 sessionId，非 conversationId）
+			const sid = String(note.sessionId || "").replace(/[^0-9a-zA-Z-]/g, "");
+			return sid ? `${cfg.webBase}/#s=${sid}` : `${cfg.webBase}/`;
 		};
 
 		const sendJson = (res, status, payload) => {
@@ -328,6 +330,7 @@ export default definePlugin({
 			});
 			if (!note) return;
 			note.group = note.kind === "fail" ? "pi-fail" : "pi";
+			note.sessionId = ev.sessionId || ""; // 宿主事件自带会话 UUID → 推送直达该会话
 			await notify(note, { durationMs });
 		}
 
@@ -394,6 +397,7 @@ export default definePlugin({
 				sound: body.sound || (iconOverride ? "bell" : "glass"), level: body.level || "active", archived: Boolean(body.archived ?? (body.quiet === "1" || body.quiet === true)),
 				badge: Number.isFinite(Number(body.badge)) ? Number(body.badge) : 1,
 				iconOverride,
+				sessionId: String(body.session || body.sessionId || ""), // 可选：点推送直达指定会话
 			}, { force: true });
 			sendJson(res, out.ok ? 200 : 502, out);
 		};

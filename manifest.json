@@ -46,7 +46,7 @@
 			"type": "text",
 			"label": "pi-web-ui 外网地址（可选）",
 			"labelEn": "pi-web-ui public URL (optional)",
-			"hint": "选填，例如 https://cockpit.example.com。填写后推送可跳转回 pi-web-ui；不填仍可接收通知，但没有跳转链接。"
+			"hint": "选填，例如 https://cockpit.example.com。填写后推送可跳转回 pi-web-ui，任务事件推送还会自动附上 #s=<会话 UUID>，点一下直达完成/出错的那条会话；不填仍可接收通知，但没有跳转链接。"
 		},
 		{
 			"key": "mode",

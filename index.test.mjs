@@ -448,5 +448,37 @@ describe("numSet 与失败重试（review 补盖）", () => {
 		await plugin.activate(host);
 		assert.ok(Date.now() - t0 < 50, "activate 应立即完成，不等授权结果");
 	});
+
+	it("事件推送自动附 #s=<会话UUID>；无 sessionId 时回落根路径", async () => {
+		const s = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", minRunMinutes: 0, dedupSec: 0, icon: "" };
+		const host = createMockHost({ settings: s });
+		host.storage.set("boot:lastPing", Date.now());
+		const fetches = [];
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "c1", sessionId: "01a18aa8-f143-7209-b1bb-2e84cfe8119e", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(fetches.length, 1);
+		assert.equal(JSON.parse(fetches[0].init.body).url, "https://cockpit.test/#s=01a18aa8-f143-7209-b1bb-2e84cfe8119e");
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "error", conversationId: "c2", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(JSON.parse(fetches[1].init.body).url, "https://cockpit.test/");
+	});
+
+	it("外部 /send 可选 session：url 附 #s=，非法字符被洗", async () => {
+		const s = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", minRunMinutes: 0, dedupSec: 0, icon: "" };
+		const host = createMockHost({ settings: s });
+		host.storage.set("boot:lastPing", Date.now());
+		const fetches = [];
+		host.net.fetch = async (url, init) => { fetches.push({ url, init }); return { status: 200, text: async () => '{"code":200}' }; };
+		await plugin.activate(host);
+		const route = host.mock.routes.find((r) => r.method === "POST" && r.path === "/send");
+		await route.handler({ body: { title: "t1", session: "abcd-1234" } }, { writeHead: () => {}, end: () => {} });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(JSON.parse(fetches[0].init.body).url, "https://cockpit.test/#s=abcd-1234");
+		await route.handler({ body: { title: "t2", session: "x/../<script>" } }, { writeHead: () => {}, end: () => {} });
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(JSON.parse(fetches[1].init.body).url, "https://cockpit.test/#s=xscript");
+	});
 });
 });
