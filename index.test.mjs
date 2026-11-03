@@ -84,7 +84,7 @@ describe("buildPayload", () => {
 });
 
 describe("activate（mock host）", () => {
-	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", muteWhenActive: 0, minRunMinutes: 0, dedupSec: 0, icon: "https://x/i.png", morningCron: "" };
+	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", minRunMinutes: 0, dedupSec: 0, icon: "https://x/i.png", morningCron: "" };
 
 	const requestTest = (host, headers = { "content-type": "application/json" }) => new Promise((resolve) => {
 		const route = host.mock.routes.find((r) => (r.path || r[1]) === "/test");
@@ -119,7 +119,7 @@ describe("activate（mock host）", () => {
 		for (const p of ["/ping", "/status", "/send", "/ack"]) assert.ok(routes.includes(p), `缺路由 ${p}`);
 	});
 
-	it("前台活跃窗口=0 时事件会真投递到 /push", async () => {
+	it("不限时长时完成事件真投递到 /push", async () => {
 		const host = createMockHost({ settings });
 		const fetches = [];
 		host.fetch = async (url, init) => {
@@ -293,7 +293,7 @@ describe("activate（mock host）", () => {
 	it("未配置时只报本来真要发的事件：短完成静默丢弃，出错才报缺配置", async (t) => {
 		let now = 1_000_000;
 		t.mock.method(Date, "now", () => now);
-		const empty = { mode: "all", muteWhenActive: 0, minRunMinutes: 5, dedupSec: 0 };
+		const empty = { mode: "all", minRunMinutes: 5, dedupSec: 0 };
 		const host = createMockHost({ settings: { ...empty } });
 		host.storage.set("boot:lastPing", now);
 		await plugin.activate(host);

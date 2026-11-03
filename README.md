@@ -1,7 +1,7 @@
 # bark-notify 🔔 — 任务事件推到 Bark
 
 > 声音即优先级：完成 `glass` · 要你决策 `cicada` · 出错 `crow`+`critical`（可穿透静音/专注模式）。
-> 你在浏览器前操作时自动降级为站内提示，手机不响；点推送可回 cockpit 或一键标记「已看到」。
+> 点推送可回 cockpit 或一键标记「已看到」。
 
 ## 为什么是 plugin 而不是裸 extension
 
@@ -10,7 +10,6 @@
 | 一条命令装到别的实例 | ✅ `pi-web-ui install` | ❌ 手动拷 |
 | 密钥存放 | ✅ 设置项 `secret` 类型 → 进 secrets，不进 git | 只能 env/硬编码 |
 | 点推送回环 | ✅ `route` → `/plugins-api/bark-notify/ack` | 无 HTTP 面 |
-| 知道你是否在前台 | ✅ `onMessage` / `getActiveConversation` | 拿不到 |
 | 推送档位 / 定时晨报 | ✅ 插件设置 + `schedule` | 无 |
 
 ## 安装
@@ -67,7 +66,7 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
 
 两条路都没走通也不会让你闷在鼓里：插件会当场点名「「bark.example.com」尚未获准出站」。
 
-可选：推送档位（完成+决策+出错 / 只推决策+出错 / 全静音）、前台静音窗口、最短运行时长阈值、去重窗口、图标 URL（**默认空**）、晨报 cron。所谓「全推」也不是字面全推：`turn_end`/`tool_delta` 等高频事件任何档位都不推；「完成」还受最短运行时长过滤（设 0 = 不限）。
+可选：推送档位（完成+决策+出错 / 只推决策+出错 / 全静音）、完成通知最短运行时长（默认 5 分钟）、去重窗口、图标 URL（**默认空**）、晨报 cron。所谓「全推」也不是字面全推：`turn_end`/`tool_delta` 等高频事件任何档位都不推；「完成」还受最短运行时长过滤（设 0 = 不限）。
 
 ## 事件 → 通知映射
 

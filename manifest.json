@@ -5,8 +5,8 @@
 	"version": "0.1.0",
 	"icon": "🔔",
 	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9\"/><path d=\"M13.73 21a2 2 0 0 1-3.46 0\"/></svg>",
-	"description": "任务完成 / 需要决策 / 出错时推送到 Bark；声音即优先级，浏览器在前台时自动降级为站内提示，点击推送可回到会话或一键确认。",
-	"descriptionEn": "Pushes to Bark when a run finishes, needs your decision, or dies. Sound encodes priority; suppresses to in-app toast while the browser tab is active; tapping a push returns to the conversation or acks it.",
+	"description": "任务完成 / 需要决策 / 出错时推送到 Bark；声音即优先级，点击推送可回到会话或一键确认。",
+	"descriptionEn": "Pushes to Bark when a run finishes, needs your decision, or dies. Sound encodes priority; tapping a push returns to the conversation or acks it.",
 	"homepage": "https://github.com/onjim/bark-notify",
 	"apiVersion": 2,
 	"view": false,
@@ -58,16 +58,6 @@
 				{ "value": "important", "label": "只推：需决策 + 出错", "labelEn": "Only decisions + failures" },
 				{ "value": "silent", "label": "全静音（只记站内）", "labelEn": "Silent (in-app log only)" }
 			]
-		},
-		{
-			"key": "muteWhenActive",
-			"type": "number",
-			"label": "前台静音窗口（秒）",
-			"labelEn": "Mute while active (sec)",
-			"default": 120,
-			"min": 0,
-			"max": 3600,
-			"hint": "最近 N 秒内浏览器有过交互 → 不推手机，只在站内提示。0 = 关闭该判断。"
 		},
 		{
 			"key": "minRunMinutes",

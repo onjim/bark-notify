@@ -9,8 +9,6 @@
  *      jq '@uri' 拼 URL 时非 ASCII 会变成字面量 "null"（踩过），故统一走 POST。
  *   3. 回环：GET /plugins-api/bark-notify/ack?t=<id> —— 手机上点一下推送即视为确认，
  *      这是单向 APNs 通道里唯一能形成的反馈闭环（返回极简 HTML，不留 JSON 白页）。
- *
- * 前台不打扰：最近 muteWhenActive 秒内浏览器有过上行消息 → 降级为站内提示（不推手机）。
  */
 import { definePlugin } from "./sdk/index.mjs";
 
@@ -159,7 +157,6 @@ export default definePlugin({
 		const startedAt = new Map();          // conversationId → run 起始 ms
 		const dedup = new Map();             // hash → 最近投递 ms
 		const recent = [];                  // 最近 20 条投递记录（/status 用）
-		let lastClientActivity = 0;
 		let morningStop = null;
 
 		const cfgOf = () => {
@@ -176,7 +173,6 @@ export default definePlugin({
 				webBase: clean(s.webBase),
 				icon: clean(s.icon),
 				mode: s.mode || "important",
-				muteWhenActive: Number(s.muteWhenActive ?? 120),
 				minRunMs: Number(s.minRunMinutes ?? 5) * 60_000,
 				dedupSec: Number(s.dedupSec ?? 300),
 				morningCron: String(s.morningCron ?? "").trim(),
@@ -242,7 +238,7 @@ export default definePlugin({
 			if (recent.length > 20) recent.length = 20;
 		};
 
-		/** 投递一条通知：先过静音/时长/去重/前台等抑制门槛，真要投递了才查配置与授权。
+		/** 投递一条通知：先过档位/时长/去重等抑制门槛，真要投递了才查配置与授权。
 		 *  顺序关键：被时长/档位过滤掉的事件本来就不会发，不该回头报「未配置」。 */
 		async function notify(note, opts = {}) {
 			if (!note) return { ok: false, skipped: "no-note" };
@@ -264,13 +260,6 @@ export default definePlugin({
 				if (prev && now - prev < cfg.dedupSec * 1000) { record({ ...note, result: "dedup" }); return { ok: false, skipped: "dedup" }; }
 				dedup.set(k, now);
 				if (dedup.size > 500) for (const [hk, hv] of dedup) { if (now - hv > cfg.dedupSec * 1000) dedup.delete(hk); }
-			}
-			// 前台降级：你正在浏览器里操作 → 站内提示，手机不响（这条不碰 Bark，无需配置）
-			const active = cfg.muteWhenActive > 0 && lastClientActivity > 0 && now - lastClientActivity < cfg.muteWhenActive * 1000;
-			if (active && !opts.force) {
-				host.notify("info", `${note.title}（站内提示：手机在你操作时不响）`, note.title);
-				record({ ...note, result: "in-app" });
-				return { ok: false, skipped: "tab-active" };
 			}
 			// 到这里是真要往手机发了：自架域名先确保授权（用户点同意即记住），批不下来才算问题
 			if (!(await ensureNetGrant(cfg.server, { retry: opts.retryAuthorization }))) {
@@ -341,18 +330,8 @@ export default definePlugin({
 
 		const offRun = host.onRunEvent((ev) => { handleEvent(ev, "run").catch((err) => host.log("error", String(err?.message || err))); });
 		const offTool = host.onToolEvent?.((ev) => { handleEvent(ev, "tool").catch(() => {}); });
-		// 客户端上行消息统一交给下面的 handleUpstream（它顺手记「人在屏前」）
 
 		const curMode = () => cfgOf().mode;
-
-		function handleUpstream(msg, reply) {
-			lastClientActivity = Date.now();
-			const action = typeof msg?.action === "string" ? msg.action : "";
-			if (action === "bark-notify:status") { reply?.({ ok: true, mode: curMode(), recent: recent.slice(0, 10), hasKey: Boolean(cfgOf().barkKey), icon: cfgOf().icon || null, missing: missingCfg(), capabilities: caps }); return; }
-		}
-		// 能回包的优先；只有 onMessage（旧宿主/mock）时走 fire-and-forget，重复投递由去重窗口吃掉
-		const offClient = host.onClientMessage?.((msg, reply) => handleUpstream(msg, reply));
-		const offUpstream = host.onMessage((msg) => handleUpstream(msg, () => {}));
 
 		/** 能力自检：权限族声明不全时，调用会被宿主静默拒（只留一行日志），翻志很痛。
 		 *  这里逐项探一下，结果挂到 /ping 与设置面板，拒了当场就知道是哪个族。 */
@@ -528,7 +507,7 @@ export default definePlugin({
 		}
 
 		return () => {
-			for (const off of [offRun, offTool, offUpstream, offClient, offToolReg, offSettings]) { try { off?.(); } catch {} }
+			for (const off of [offRun, offTool, offToolReg, offSettings]) { try { off?.(); } catch {} }
 			try { morningStop?.(); } catch {}
 		};
 	},
