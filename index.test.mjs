@@ -5,7 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import plugin, { classifyEvent, buildPayload, dedupeKey, pickProject, numSet } from "./index.mjs";
+import plugin, { classifyEvent, buildPayload, dedupeKey, pickProject, numSet, summarizeTurn, pickGit, firstSentence, askNote } from "./index.mjs";
 import { createMockHost } from "./sdk/index.mjs";
 
 describe("classifyEvent", () => {
@@ -499,4 +499,198 @@ describe("numSet 与失败重试（review 补盖）", () => {
 		assert.equal(recent[0].result, "sent", "普通对象响应应被判 sent（回归：旧写法 text 丢空误判 http-200）");
 	});
 });
+});
+
+describe("锁屏信息量（detail 三档）", () => {
+	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", minRunMinutes: 0, dedupSec: 0, icon: "", detail: "standard" };
+	const snap = {
+		cwd: "/home/dev/repos/app",
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "把登录改成 SSO" }] },
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", text: "先看看现状" },
+					{ type: "toolCall", name: "read", input: { path: "/home/dev/repos/app/src/auth.ts" } },
+					{ type: "toolResult", content: [{ type: "text", text: "export function login…" }] },
+					{ type: "toolCall", name: "edit", input: { path: "/home/dev/repos/app/src/auth.ts" } },
+					{ type: "toolCall", name: "bash", input: { command: "npm test" } },
+					{ type: "toolResult", content: [{ type: "text", text: "Tests 12 passed" }] },
+					{ type: "toolCall", name: "write", input: { file_path: "/home/dev/repos/app/src/sso.ts" } },
+					{ type: "text", text: "已把登录改为 SSO，并接好回调。\n\n下一步：请在测试环境验证回调域名。" },
+				],
+			},
+		],
+	};
+	const stats = summarizeTurn(snap);
+	const base = { project: "app", durationMs: 65_000, convId: "abcd1234" };
+
+	it("从快照抠出：文件清单 / 工具数 / 测试结论 / 首句 / 下一步", () => {
+		assert.deepEqual(stats.files, ["src/auth.ts", "src/sso.ts"]); // 去重 + 只留末两级
+		assert.equal(stats.toolCalls, 4);
+		assert.equal(stats.bashCalls, 1);
+		assert.equal(stats.testLine, "测试通过");
+		assert.match(stats.lastText, /已把登录改为 SSO/);
+		assert.match(stats.nextStep, /测试环境验证回调域名/);
+	});
+
+	it("句中的「下一步」不会被误抓（只认行首）", () => {
+		const s = summarizeTurn({
+			cwd: "/home/dev/repos/app",
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "改完了吗" }] },
+				{ role: "assistant", content: [{ type: "text", text: "我会把改动做完，和下一步计划一起给你。" }] },
+			],
+		});
+		assert.equal(s.nextStep, "");
+		const t = summarizeTurn({
+			cwd: "/home/dev/repos/app",
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }] },
+				{ role: "assistant", content: [{ type: "text", text: "改造完成，风险可控。\n下一步：刷新浏览器让新版接管。" }] },
+			],
+		});
+		assert.equal(t.nextStep, "刷新浏览器让新版接管。");
+	});
+
+	it("minimal 档 = 旧文案，不夹带摘要", () => {
+		const n = classifyEvent({ type: "run_end", stopReason: "end_turn" }, { ...base, detail: "minimal" });
+		assert.equal(n.title, "✅ app · 任务完成");
+		assert.match(n.body, /耗时 1m05s/);
+		assert.equal(n.body.includes("改了"), false);
+	});
+
+	it("standard 档：标题带时长与文件数，正文四行（摘要/质量/产出/下一步）", () => {
+		const n = classifyEvent({ type: "run_end", stopReason: "end_turn" }, { ...base, detail: "standard", stats, git: { branch: "main", dirty: 2 } });
+		assert.equal(n.title, "✅ app · 任务完成 · 1m05s · 2 文件");
+		const lines = n.body.split("\n");
+		assert.equal(lines.length, 4);
+		assert.match(lines[0], /已把登录改为 SSO/);
+		assert.match(lines[1], /main\* · 4 次工具 · 测试通过/);
+		assert.match(lines[2], /改了 2 个: src\/auth\.ts, src\/sso\.ts/);
+		assert.match(lines[3], /下一步:.*测试环境验证回调域名/);
+	});
+
+	it("rich 档多一行会话与轮次，干净分支不带 *", () => {
+		const n = classifyEvent({ type: "run_end", stopReason: "end_turn" }, { ...base, detail: "rich", stats, git: { branch: "main", dirty: 0 } });
+		assert.match(n.body, /main · 4 次工具/);
+		assert.match(n.body, /会话 abcd1234 · 1 轮/);
+	});
+
+	it("出错时 critical 不变，standard 把摘要与产出排上去", () => {
+		const n = classifyEvent({ type: "run_end", stopReason: "error" }, { ...base, durationMs: 9000, detail: "standard", stats, git: { branch: "fix", dirty: 1 } });
+		assert.equal(n.level, "critical");
+		assert.equal(n.title, "❌ app · 中断(error) · 9s · 2 文件");
+		assert.match(n.body, /fix\* · 4 次工具 · 测试通过/);
+	});
+
+	it("没快照 / 没 git → 优雅降级（少行，不缺字段，不抛）", () => {
+		const n = classifyEvent({ type: "run_end", stopReason: "end_turn" }, { project: "app", durationMs: 1000, convId: "zz", detail: "standard" });
+		assert.equal(n.title, "✅ app · 任务完成 · 1s");
+		assert.ok(n.body.length > 0);
+	});
+
+	it("pickGit 容忍各家形状，拿不到回 null", () => {
+		assert.deepEqual(pickGit({ branch: "refs/heads/main", files: [1, 2] }), { branch: "main", dirty: 2 });
+		assert.deepEqual(pickGit({ current: "dev", clean: false }), { branch: "dev", dirty: 1 });
+		assert.equal(pickGit({ ok: false, error: "not a git repo" }), null);
+		assert.equal(pickGit(null), null);
+	});
+
+	it("firstSentence 按中英文标点切并限长", () => {
+		assert.equal(firstSentence("第一句。第二句。"), "第一句。");
+		assert.equal(firstSentence("one two. three", 8), "one two.");
+		assert.equal(firstSentence("   "), "");
+	});
+
+	it("端到端：standard 档 + 真快照 + scm.status → 推送里带分支与文件数", async () => {
+		const host = createMockHost({ settings: { ...settings, detail: "standard", minRunMinutes: 0 } });
+		host.storage.set("boot:lastPing", Date.now());
+		host.getActiveConversation = () => snap;
+		host.scm = { status: async () => ({ branch: "refs/heads/main", files: [1, 2, 3] }) };
+		const fetches = [];
+		host.net.fetch = async (url, init) => { fetches.push(JSON.parse(init.body)); return { ok: true, status: 200, text: '{"code":200}' }; };
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "end_turn", conversationId: "c1", sessionId: "s1", at: Date.now() });
+		await new Promise((r) => setTimeout(r, 60));
+		assert.equal(fetches.length, 1);
+		assert.match(fetches[0].title, /· 2 文件/);
+		assert.match(fetches[0].body, /main\* · 4 次工具 · 测试通过/);
+		assert.match(fetches[0].body, /改了 2 个: src\/auth\.ts, src\/sso\.ts/);
+	});
+});
+
+describe("等回答提醒（ask_user_question → 回合阻塞）", () => {
+	const settings = { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "important", minRunMinutes: 5, dedupSec: 0, icon: "", askAlert: "on" };
+	const snap = { cwd: "/home/dev/repos/app", messages: [{ role: "user", content: [{ type: "text", text: "选个方案" }] }, { role: "assistant", content: [{ type: "text", text: "有两个路子：A 稳，B 快。" }] }] };
+	const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+
+	function boot(over = {}) {
+		const host = createMockHost({ settings: { ...settings, ...over.settings } });
+		host.storage.set("boot:lastPing", Date.now());
+		host.requestPermission = async () => true;
+		host.getActiveConversation = () => snap;
+		const got = [];
+		host.net.fetch = async (url, init) => { got.push(JSON.parse(init.body)); return { ok: true, status: 200, text: '{"code":200}' }; };
+		return { host, got };
+	}
+
+	it("askNote：critical + campaign，文案说清在等你", () => {
+		const n = askNote("app");
+		assert.equal(n.kind, "ask");
+		assert.equal(n.level, "critical");
+		assert.equal(n.sound, "campaign");
+		assert.equal(n.title, "⏳ app · 等你回答");
+	});
+
+	it("提问一到就推，important 档也拦不住（force 通道）", async () => {
+		const { host, got } = boot();
+		await plugin.activate(host);
+		host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "c1", sessionId: "s1", toolCallId: "t1" });
+		await nap(80);
+		assert.equal(got.length, 1);
+		assert.equal(got[0].title, "⏳ app · 等你回答");
+		assert.equal(got[0].sound, "campaign");
+		assert.equal(got[0].group, "pi-ask");
+		assert.match(got[0].url, /#s=s1/);
+	});
+
+	it("同一 toolCallId 重放不重推", async () => {
+		const { host, got } = boot();
+		await plugin.activate(host);
+		const ev = { phase: "start", toolName: "ask_user_question", conversationId: "c1", toolCallId: "t1" };
+		host.mock.emit("onToolEvent", ev);
+		host.mock.emit("onToolEvent", ev);
+		await nap(80);
+		assert.equal(got.length, 1);
+	});
+
+	it("回答后不补发；完成通知里出现「中途等你 X」", async () => {
+		const { host, got } = boot({ settings: { mode: "all", minRunMinutes: 0 } });
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "c1", sessionId: "s1" });
+		host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "c1", sessionId: "s1", toolCallId: "t1" });
+		await nap(60);
+		host.mock.emit("onToolEvent", { phase: "end", toolName: "ask_user_question", conversationId: "c1", sessionId: "s1", toolCallId: "t1", durationMs: 8000, isError: false });
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "end_turn", conversationId: "c1", sessionId: "s1", at: Date.now() });
+		await nap(150);
+		assert.equal(got.length, 2, "一条提问 + 一条完成，中间不插墓");
+		assert.match(got[0].title, /等你回答/);
+		assert.match(got[1].title, /任务完成/);
+		assert.match(got[1].body, /中途等你 8s/);
+	});
+
+	it("askAlert=off 就安静；非提问工具与垃圾载荷不推不抛", async () => {
+		const a = boot({ settings: { askAlert: "off" } });
+		await plugin.activate(a.host);
+		a.host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "c9", toolCallId: "t9" });
+		const b = boot();
+		await plugin.activate(b.host);
+		b.host.mock.emit("onToolEvent", { phase: "start", toolName: "bash", conversationId: "c9", toolCallId: "t9" });
+		b.host.mock.emit("onToolEvent", null);
+		b.host.mock.emit("onToolEvent", { phase: "start" });
+		await nap(100);
+		assert.equal(a.got.length, 0);
+		assert.equal(b.got.length, 0);
+	});
 });

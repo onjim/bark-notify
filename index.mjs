@@ -60,41 +60,198 @@ const fmtDur = (ms) => {
 const FAIL_STOP = new Set(["error", "aborted", "abort", "cancelled", "canceled", "timeout", "refusal"]);
 const WARN_STOP = new Set(["length", "content_filter", "max_tokens", "context_length"]);
 
+// ── 会话快照 → 本轮产出摘要 ──
+// 锁屏展开也就 4 行（中文每行 ~18 字），所以不求全，只把「干了什么 / 质量 / 下一步」挑值钱的塞。
+// 全部写成纯函数，不起宿主也能测。
+const blocksOf = (msg) => (Array.isArray(msg?.content) ? msg.content : []);
+const isToolCall = (b) => Boolean(b && (b.type === "toolCall" || b.type === "tool_use" || b.type === "tool-call"));
+const isToolResult = (b) => Boolean(b && (b.type === "toolResult" || b.type === "tool_result" || b.type === "tool-result"));
+const toolNameOf = (b) => String(b?.name ?? b?.toolName ?? b?.tool ?? "").trim();
+const toolArgsOf = (b) => { const a = b?.input ?? b?.args ?? b?.arguments ?? b?.params ?? b?.parameters; return a && typeof a === "object" ? a : {}; };
+const textOf = (b) => (b && b.type === "text" && typeof b.text === "string" ? b.text : "");
+const resultTextOf = (b) => (isToolResult(b) ? blocksOf(b).map(textOf).join("\n") || (typeof b?.text === "string" ? b.text : "") : "");
+
+/** 取首句（按中英文句末标点切），锁屏首行靠它。 */
+export function firstSentence(value, max = 72) {
+	const t = String(value || "").replace(/\s+/g, " ").trim();
+	if (!t) return "";
+	const m = t.match(/^.{1,300}?(?:[。！？!?;；]|\.\s|$)/);   // 保留句末标点，锁屏读起来自然
+	const sent = (m ? m[0] : t).trim();
+	return sent.length > max ? `${sent.slice(0, max - 1)}…` : sent;
+}
+
+const WRITE_TOOLS = new Set(["edit", "write", "patch", "multi_edit", "multiedit", "create_file", "apply_patch", "str_replace", "notebookedit", "notebook_edit", "search_replace"]);
+const BASH_TOOLS = new Set(["bash", "shell", "exec", "run_command", "powershell", "terminal"]);
+
+/** 本轮 = 最近一条 user 消息之后的所有消息；找不到 user 就全部。 */
+function turnWindow(messages) {
+	const list = Array.isArray(messages) ? messages : [];
+	for (let i = list.length - 1; i >= 0; i--) { if (String(list[i]?.role || "").toLowerCase() === "user") return list.slice(i + 1); }
+	return list;
+}
+
+/**
+ * 快照 → 本轮产出：碰了哪些文件、多少次工具、测试结论、末句回答、下一步。
+ * 字段全为可选语义（拿不到就是空），调用侧靠 filter(Boolean) 拼行。
+ */
+export function summarizeTurn(snap) {
+	const win = turnWindow(snap?.messages);
+	const files = [];
+	const seen = new Set();
+	const hay = [];
+	let toolCalls = 0, writeCalls = 0, bashCalls = 0;
+	for (const msg of win) {
+		for (const b of blocksOf(msg)) {
+			if (isToolCall(b)) {
+				toolCalls++;
+				const name = toolNameOf(b).toLowerCase();
+				const args = toolArgsOf(b);
+				const p = String(args.path ?? args.file_path ?? args.filePath ?? args.target ?? args.filename ?? "").trim();
+				if (WRITE_TOOLS.has(name)) {
+					writeCalls++;
+					if (p && !seen.has(p)) { seen.add(p); files.push(p.replace(/^\.?\/+/, "").split("/").slice(-2).join("/")); }
+				}
+				if (BASH_TOOLS.has(name)) bashCalls++;
+			} else if (isToolResult(b)) {
+				hay.push(resultTextOf(b));
+			}
+		}
+		const t = blocksOf(msg).map(textOf).filter(Boolean).join("\n").trim();
+		if (t) hay.push(t);
+	}
+	const assistants = win.filter((m) => String(m?.role || "").toLowerCase() === "assistant");
+	const lastText = assistants.length ? blocksOf(assistants[assistants.length - 1]).map(textOf).filter(Boolean).join("\n").trim() : "";
+	const all = hay.join("\n");
+	// 只认行首的「下一步：」——实测发现「…和下一步塞进锁屏」这种句中词会被抓成半句
+	const NEXT_RE = /(?:^|\n)\s*(?:下一步|下步|next step|待确认|需要你确认|请确认)[：: ]*([^\n]{1,80})/i;
+	const next = (lastText || "").match(NEXT_RE) || all.match(NEXT_RE);
+	const testLine = /(?:测试通过|全部通过|all tests? passed|tests?\s+\d+\s+pass|✓\s*\d+\s*pass|pass\s+\d+)/i.test(all)
+		? "测试通过"
+		: (/测试失败|tests?\s+failed|failing\s+\d+|\d+\s+failed|npm ERR/i.test(all) ? "测试失败" : "");
+	return {
+		files, writeCalls, bashCalls, toolCalls,
+		lastText: firstSentence(lastText),
+		nextStep: next ? firstSentence(next[1], 60) : "",
+		testLine,
+		turns: assistants.length,
+	};
+}
+
+/** scm.status() 各家形状不一：尽量把分支名与脏文件数抠出来，拿不到回 null。 */
+export function pickGit(st) {
+	if (!st || typeof st !== "object") return null;
+	const branch = String(st.branch ?? st.current ?? st.currentBranch ?? st.head ?? "").trim().replace(/^refs\/heads\//, "");
+	const files = Array.isArray(st.files) ? st.files : (Array.isArray(st.changed) ? st.changed : []);
+	const dirty = files.length || (st.clean === false ? 1 : 0) || Number(st.dirtyCount ?? 0) || 0;
+	if (!branch && !dirty) return null;
+	return { branch, dirty };
+}
+
+/**
+ * 模型调 ask_user_question → 整个 agent 回合阻塞在你这边。这是比「完成」更该推的时刻，
+ * 因为任务不会自己往下走。选项文字拿不到（宿主 onToolEvent 不带 args，快照里 marker 又被
+ * stripMarkers 刷空，见 serialize.js:150 / markers/marker.js:95），所以只报「在等你」，
+ * 点推送回 cockpit 就能看到选项。零 LLM、零额外请求。
+ */
+export function askNote(project) {
+	return {
+		kind: "ask",
+		title: clip(`⏳ ${project} · 等你回答`, SHORT_TITLE),
+		body: clip("模型提了问题，会话正阻塞在你这边\n回到 cockpit 选一个就能继续", SHORT_BODY),
+		sound: "campaign", level: "critical", archived: false, badge: 1,
+	};
+}
+
 /**
  * 事件 → 通知意图（纯函数，无 IO，可单测）。
  * @param ev 宿主 onRunEvent/onToolEvent 载荷：{type,conversationId,sessionId,clientId,runId,stopReason,at,…}
- * @param ctx {project, durationMs, convId, conversationTitle}
+ * @param ctx {project, durationMs, convId, detail, stats, git}
  */
 export function classifyEvent(ev, ctx = {}) {
 	if (!ev || typeof ev !== "object" || typeof ev.type !== "string") return null;
 	const proj = ctx.project || "pi";
 	const dur = fmtDur(ctx.durationMs);
 	const tail = [dur && `耗时 ${dur}`, ctx.convId && `会话 ${ctx.convId}`].filter(Boolean).join(" · ");
+	const detail = ctx.detail === "minimal" || ctx.detail === "rich" ? ctx.detail : "standard";
+	const st = ctx.stats && typeof ctx.stats === "object" ? ctx.stats : null;
+	const git = ctx.git && typeof ctx.git === "object" ? ctx.git : null;
+
+	/** 标题：在旧文案后面追加时长与产出量（「✅ proj · 任务完成 · 1m05s · 3 文件」，SHORT_TITLE=78 字符完容得下） */
+	const titleCore = (mark, what) => {
+		const bits = [`${mark} ${proj} · ${what}`];
+		if (detail !== "minimal") {
+			if (dur) bits.push(dur);
+			if (st && Array.isArray(st.files) && st.files.length) bits.push(`${st.files.length} 文件`);
+		}
+		return clip(bits.join(" · "), SHORT_TITLE);
+	};
+	/** 质量行：分支* · N 次工具 · 测试通过 */
+	const qualityLine = () => {
+		const bits = [];
+		if (git && git.branch) bits.push(`${git.branch}${git.dirty ? "*" : ""}`);
+		if (st && st.toolCalls) bits.push(`${st.toolCalls} 次工具`);
+		if (st && st.testLine) bits.push(st.testLine);
+		return bits.join(" · ");
+	};
+	/** 产出行：改了 N 个: a, b +N（standard 展 3 个，rich 展 12 个） */
+	const filesLine = () => {
+		const fs = st && Array.isArray(st.files) ? st.files : [];
+		if (!fs.length) return "";
+		const max = detail === "rich" ? 12 : 3;
+		const shown = fs.slice(0, max);
+		return `改了 ${fs.length} 个: ${shown.join(", ")}${fs.length > shown.length ? ` +${fs.length - shown.length}` : ""}`;
+	};
 
 	switch (ev.type) {
 		// run_start 不生成通知：handleEvent 只记开始时间用于「最短运行时长」判断
 		case "run_end": {
 			const stop = String(ev.stopReason || "").trim().toLowerCase();
 			if (FAIL_STOP.has(stop)) {
+				const lines = detail === "minimal"
+					? [dur && `耗时 ${dur}`, `stopReason=${stop}`, "回到 cockpit 看完整轨迹"]
+					: [
+						st && st.lastText ? clip(st.lastText, 110) : `stopReason=${stop}`,
+						qualityLine(),
+						filesLine(),
+						detail === "rich" ? `耗时 ${dur || "?"} · 会话 ${ctx.convId || "?"}` : "回 cockpit 看完整轨迹",
+					].filter(Boolean);
 				return {
 					kind: "fail",
-					title: clip(`❌ ${proj} · 中断(${stop})`, SHORT_TITLE),
-					body: clip([dur && `耗时 ${dur}`, `stopReason=${stop}`, "回到 cockpit 看完整轨迹"].filter(Boolean).join("\n"), SHORT_BODY),
+					title: titleCore("❌", `中断(${stop})`),
+					body: clip(lines.join("\n"), SHORT_BODY),
 					sound: "crow", level: "critical", archived: false, badge: 1,
 				};
 			}
 			if (WARN_STOP.has(stop)) {
+				const lines = detail === "minimal"
+					? [dur && `耗时 ${dur}`, "输出被截断或过滤，可能要续一句"]
+					: [
+						st && st.lastText ? clip(st.lastText, 110) : "输出被截断，可能要续一句",
+						qualityLine(),
+						st && st.nextStep ? `下一步: ${st.nextStep}` : "",
+						`stopReason=${stop}`,
+					].filter(Boolean);
 				return {
 					kind: "fail",
-					title: clip(`⚠️ ${proj} · 提前收尾(${stop})`, SHORT_TITLE),
-					body: clip([dur && `耗时 ${dur}`, "输出被截断或过滤，可能要续一句"].filter(Boolean).join("\n"), SHORT_BODY),
+					title: titleCore("⚠️", `提前收尾(${stop})`),
+					body: clip(lines.join("\n"), SHORT_BODY),
 					sound: "bell", level: "timeSensitive", archived: false, badge: 1,
 				};
 			}
+			const doneLines = detail === "minimal"
+				? [dur || "已完成", tail && tail.replace(/ · /g, "\n")]
+				: [
+					st && st.lastText,
+					qualityLine(),
+					filesLine(),
+					st && st.nextStep ? `下一步: ${st.nextStep}` : "",
+					ctx.waitMs ? `中途等你 ${fmtDur(ctx.waitMs)}` : "",
+					detail === "rich" ? `会话 ${ctx.convId || "?"}${st && st.turns ? ` · ${st.turns} 轮` : ""}` : "",
+				].filter(Boolean);
 			return {
 				kind: "done",
-				title: clip(`✅ ${proj} · 任务完成`, SHORT_TITLE),
-				body: clip([dur || "已完成", tail && tail.replace(/ · /g, "\n")].filter(Boolean).join("\n"), SHORT_BODY),
+				title: titleCore("✅", "任务完成"),
+				body: clip(doneLines.join("\n") || (dur || "已完成"), SHORT_BODY),
 				sound: "glass", level: "active", archived: false, badge: 1,
 			};
 		}
@@ -141,6 +298,8 @@ export default definePlugin({
 	async activate(host) {
 		/** —— 运行时状态（全部内存，重启即清；配置以设置面板为准）—— */
 		const startedAt = new Map();          // conversationId → run 起始 ms
+		const waitingAsk = new Map();         // conversationId → {at, toolCallId}：模型提问中（回合正阻塞）
+		const lastWaitMs = new Map();         // conversationId → 上次等回答花了多久，收尾时补一行「中途等你 X」
 		const dedup = new Map();             // hash → 最近投递 ms
 		const recent = [];                  // 最近 20 条投递记录（/status 用）
 
@@ -160,6 +319,8 @@ export default definePlugin({
 				mode: s.mode === "all" ? "all" : "important", // 旧版残留的 silent 值收敛到只推出错，不会升级后变全推
 				minRunMs: numSet(s.minRunMinutes, 5) * 60_000, // 清空回默认 5 分钟，0 = 不限
 				dedupSec: numSet(s.dedupSec, 300),
+				detail: s.detail === "minimal" || s.detail === "rich" ? s.detail : "standard", // 锁屏信息量
+				askAlert: s.askAlert !== "off", // 模型提问（回合阻塞）提醒：critical，不受 mode 限制
 			};
 		};
 		/** 缺必填项 / 域名不在出站白名单：两条都让人当场看到，而不是默默不发 */
@@ -312,6 +473,14 @@ export default definePlugin({
 				return;
 			}
 			if (!NOTIFIABLE.has(ev.type)) return;
+			// 收尾时若提问还挂着（你直接在 cockpit 回了/取消了），也结算；累加本轮全部等待时长
+			let waitMs;
+			{
+				const w = waitingAsk.get(cid);
+				if (w) { waitingAsk.delete(cid); waitMs = Math.max(0, Date.now() - w.at); }
+				const lw = lastWaitMs.get(cid);
+				if (lw !== undefined) { lastWaitMs.delete(cid); waitMs = waitMs === undefined ? lw : waitMs + lw; }
+			}
 			let durationMs;
 			{
 				const t0 = startedAt.get(cid);
@@ -323,10 +492,24 @@ export default definePlugin({
 				snap = host.getActiveConversation({ clientId: ev.clientId }) || host.getActiveConversation();
 			} catch { /* 快照拿不到就用兜底名 */ }
 			const project = pickProject(snap);
+			const detail = cfgOf().detail;
+			let stats = null;
+			let git = null;
+			if (detail !== "minimal") {
+				try { stats = summarizeTurn(snap); } catch { /* 摘要尽力而为 */ }
+				try {
+					const st = typeof host.scm?.status === "function" ? await host.scm.status() : null;
+					git = pickGit(st);
+				} catch { /* 非 git 工作区或被门控：没分支就少一行，不影响投递 */ }
+			}
 			const note = classifyEvent(ev, {
 				project,
 				durationMs,
 				convId: shortId(cid),
+				detail,
+				stats,
+				git,
+				waitMs,
 			});
 			if (!note) return;
 			note.group = note.kind === "fail" ? "pi-fail" : "pi";
@@ -334,8 +517,44 @@ export default definePlugin({
 			await notify(note, { durationMs });
 		}
 
-		// 只订阅 onRunEvent：宿主 onToolEvent 载荷无 type 字段（phase/toolName 那套），永不产出通知，订了白烧 CPU
+		/** 提问桥：toolName === ask_user_question 就是「模型在等人」的唯一插件侧信号。
+		 *  start 推一次（同 toolCallId 不重推）；end 不推，只记下等了多久，留给完成通知。 */
+		async function handleToolEvent(raw) {
+			if (!raw || typeof raw !== "object") return;
+			const ev = raw;
+			const name = String(ev.toolName ?? "");
+			if (name !== "ask_user_question" && name !== "ask_user") return;
+			if (!cfgOf().askAlert) return;
+			const cid = ev.conversationId || ev.sessionId || ev.clientId || "anon";
+			if (ev.phase === "start") {
+				const callId = String(ev.toolCallId ?? "");
+				if (waitingAsk.get(cid)?.toolCallId === callId) return;
+				waitingAsk.set(cid, { at: Date.now(), toolCallId: callId });
+				let snap = null;
+				try {
+					snap = host.getActiveConversation({ clientId: ev.clientId }) || host.getActiveConversation();
+				} catch { /* 拿快照取项目名，拿不到就兜底 */ }
+				const note = askNote(pickProject(snap));
+				note.group = "pi-ask";
+				note.sessionId = ev.sessionId || ""; // 点推送直达正在等人的那条会话
+				await notify(note, { force: true });  // 强制通道：不受 mode / 时长过滤限制
+			}
+			// phase === "end"：不推新通知（你都回了，再推就是打饫），只记账
+			if (ev.phase === "end") {
+				const w = waitingAsk.get(cid);
+				waitingAsk.delete(cid);
+				if (!w) return;
+				const ms = Number.isFinite(ev.durationMs) ? Math.max(0, Number(ev.durationMs)) : Math.max(0, Date.now() - w.at);
+				lastWaitMs.set(cid, ms);
+			}
+		}
+
+		// onToolEvent 载荷是 {phase,toolName,conversationId,toolCallId,durationMs?,isError?}（agent-service.js:4813/4851），
+		// 没有 type 字段，不能当事件流跑；但它带 toolName，而 ask_user_question 就是「回合卡在等人」的唯一信号。
 		const offRun = host.onRunEvent((ev) => { handleEvent(ev).catch((err) => host.log("error", String(err?.message || err))); });
+		const offAsk = typeof host.onToolEvent === "function"
+			? host.onToolEvent((raw) => { handleToolEvent(raw).catch((err) => host.log("warn", `提问事件处理失败：${String(err?.message ?? err)}`)); })
+			: null;
 
 		const curMode = () => cfgOf().mode;
 
@@ -522,7 +741,7 @@ export default definePlugin({
 		}
 
 		return () => {
-			for (const off of [offRun, offToolReg, offSettings]) { try { off?.(); } catch {} }
+			for (const off of [offRun, offAsk, offToolReg, offSettings]) { try { off?.(); } catch {} }
 		};
 	},
 });

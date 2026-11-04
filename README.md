@@ -38,6 +38,8 @@ pi-web-ui uninstall bark-notify
 | Bark 服务器 | 例 `https://bark.example.com`，只 scheme+域名，**不带端口** |
 | Bark 设备密钥 | `secret` 类型，存进 secrets，不进 git |
 | pi-web-ui 外网地址（可选） | 填写后可从通知跳转回 pi-web-ui；留空仍可接收通知，但没有跳转链接。例 `https://cockpit.example.com` |
+| 锁屏信息量 | `精简`（状态 + 时长两行）/ `标准`（默认：末句摘要、分支、测试结论、文件数、下一步）/ `详尽`（文件清单全列 + 会话与轮次）。全本地解析（会话快照 + `git status`），**不吃 token** |
+| 模型提问提醒 | 默认开。模型调 `ask_user_question` 时整个回合阻塞在你这边 → `⏳ <项目> · 等你回答`，critical 且不受档位与时长限制；回答后的等待时长写进本轮完成通知的「中途等你 X」一行 |
 
 Bark 服务器和设备密钥为必填项，插件**不给默认值**。缺少任一项时不会推送：
 站内通知 + 日志 + `GET /plugins-api/bark-notify/ping` 都会点名缺什么（`"configured": false, "missing": ["server", ...]`）。
@@ -74,6 +76,7 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
 | `run_end`（正常 stopReason） | `✅ <项目> · 任务完成` | `glass` / active | 运行超过「最短运行时长」才推，默认 5 分钟；未捕获开始事件时不推 |
 | `run_end`（`length`/`content_filter`） | `⚠️ <项目> · 提前收尾` | `bell` / timeSensitive | 提示要续一句 |
 | `run_end`（`error`/`aborted`/`timeout`…） | `❌ <项目> · 中断` | `crow` / **critical** | 穿透静音 |
+| `onToolEvent`（`ask_user_question` 的 start） | `⏳ <项目> · 等你回答` | `campaign` / **critical** | 强制通道，任何档位都推；同一 `toolCallId` 不重推；`end` 不补发，只记下等了多久 |
 | `run_start` | — | — | 只记录开始时间，不发送通知 |
 | `turn_end` / `tool_delta` / … | — | 不推 | 防刷屏 |
 
@@ -99,6 +102,12 @@ pi-web-ui install ./plugins/bark-notify --name bark-notify --force   # 然后刷
    换你自己的 Bark 域名靠 `host.requestPermission` 动态授权（首次推送时弹框放行），否则出站全拒。
 4. 权限漏声明时宿主往往只是**静默拒绝**，所以本插件在 activate 时逐项探测能力，结果挂在
    `GET /plugins-api/bark-notify/ping` 的 `capabilities` / `blocked` 字段和启动日志里（`能力 9/9 可用`）。
+
+5. **「模型给的选项」在插件侧看不到**：助手文本里的 `[[action:suggest:...]]` marker 会在序列化时被
+   `stripMarkers` 整段刷空（`serialize.js:150` → `markers/marker.js:95`），宿主的问题桥只把
+   `question_pending` 发给浏览器 WS，插件能订阅的 15 个事件里没有它。唯一缝隙是 `onToolEvent`：
+   它带 `phase`/`toolName`（所以能知道「卡在等人」），**不带 `args`**（所以拿不到选项文字）。
+   因此提醒只说「在等你」，选项得点推送回 cockpit 看。
 
 `level=critical` 还需 iOS 设置 → 通知 → Bark → 允许关键通知，否则会静默降级成普通横幅。
 
