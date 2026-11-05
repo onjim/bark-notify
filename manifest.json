@@ -2,16 +2,17 @@
 	"id": "bark-notify",
 	"name": "Bark 推送",
 	"nameEn": "Bark Push",
-	"version": "0.3.0",
+	"version": "0.1.1",
 	"icon": "🔔",
 	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9\"/><path d=\"M13.73 21a2 2 0 0 1-3.46 0\"/></svg>",
-	"description": "任务完成 / 出错 / 模型等你回答时推送到 Bark；声音即优先级，锁屏直接看到干了什么、测试过没过、下一步；点击推送可回到 cockpit。",
-	"descriptionEn": "Bark pushes on completion, failure, and when the model is blocked waiting for you. Sound encodes priority; the lock screen shows what changed, test status and the next step; tapping returns to the cockpit.",
+	"description": "任务完成 / 出错 / 模型等你回答时推送到 Bark；声音区分通知类型，可按触发条件选择普通、时效性或关键通知，锁屏直接看到干了什么、测试过没过、下一步；点击推送可回到 cockpit。",
+	"descriptionEn": "Bark pushes on completion, failure, and when the model is blocked waiting for you. Notification level is configurable per trigger; the lock screen shows what changed, test status and the next step; tapping returns to the cockpit.",
 	"homepage": "https://github.com/onjim/bark-notify",
 	"apiVersion": 2,
 	"view": false,
 	"permissions": [
 		"net",
+		"fs:read",
 		"secrets",
 		"storage",
 		"ui",
@@ -52,13 +53,138 @@
 			"key": "mode",
 			"type": "select",
 			"label": "推送档位",
-			"labelEn": "Notify level",
+			"labelEn": "Notification scope",
 			"default": "important",
 			"options": [
 				{ "value": "all", "label": "全部：完成 + 出错", "labelEn": "All: completions + errors" },
 				{ "value": "important", "label": "只推出错（默认）", "labelEn": "Errors only (default)" }
 			],
 			"hint": "自动事件按档处理：出错/中断任何档都推且不受时长限制；「完成」仅【全部】档推，且另受下方「最短运行时长」过滤（秒回不打扰）。以下属强制通道，不受档位限制：上线回执、设置页自检 /test、外部 /send 与 bark_notify 工具推送。"
+		},
+		{
+			"key": "completionLevel",
+			"type": "select",
+			"label": "正常完成 · 通知级别",
+			"labelEn": "Completion notification level",
+			"default": "active",
+			"options": [
+				{
+					"value": "active",
+					"label": "普通提示（默认）",
+					"labelEn": "Active (default)"
+				},
+				{
+					"value": "timeSensitive",
+					"label": "时效性通知",
+					"labelEn": "Time-sensitive"
+				},
+				{
+					"value": "critical",
+					"label": "关键通知 / 静音穿透（需系统授权）",
+					"labelEn": "Critical / bypass mute (requires system permission)"
+				}
+			],
+			"hint": "模型正常结束一轮任务（run_end 的非异常、非截断 stopReason）。仍受推送档位和最短运行时长限制。 选择关键通知需在 iOS/Bark 开启关键通知权限；缺省或非法值按普通提示处理。"
+		},
+		{
+			"key": "interruptionLevel",
+			"type": "select",
+			"label": "异常或中断 · 通知级别",
+			"labelEn": "Failure or interruption notification level",
+			"default": "active",
+			"options": [
+				{
+					"value": "active",
+					"label": "普通提示（默认）",
+					"labelEn": "Active (default)"
+				},
+				{
+					"value": "timeSensitive",
+					"label": "时效性通知",
+					"labelEn": "Time-sensitive"
+				},
+				{
+					"value": "critical",
+					"label": "关键通知 / 静音穿透（需系统授权）",
+					"labelEn": "Critical / bypass mute (requires system permission)"
+				}
+			],
+			"hint": "报错、超时、取消、中止、拒绝：error / timeout / cancelled / canceled / abort / aborted / refusal，以及 run_error / agent_error。任何推送档位均可发送，不受时长限制。 选择关键通知需在 iOS/Bark 开启关键通知权限；缺省或非法值按普通提示处理。"
+		},
+		{
+			"key": "truncationLevel",
+			"type": "select",
+			"label": "提前收尾 · 通知级别",
+			"labelEn": "Truncation notification level",
+			"default": "active",
+			"options": [
+				{
+					"value": "active",
+					"label": "普通提示（默认）",
+					"labelEn": "Active (default)"
+				},
+				{
+					"value": "timeSensitive",
+					"label": "时效性通知",
+					"labelEn": "Time-sensitive"
+				},
+				{
+					"value": "critical",
+					"label": "关键通知 / 静音穿透（需系统授权）",
+					"labelEn": "Critical / bypass mute (requires system permission)"
+				}
+			],
+			"hint": "达到输出长度、上下文或内容过滤限制：length / max_tokens / context_length / content_filter。任何推送档位均可发送，不受时长限制。 选择关键通知需在 iOS/Bark 开启关键通知权限；缺省或非法值按普通提示处理。"
+		},
+		{
+			"key": "questionLevel",
+			"type": "select",
+			"label": "等待回答 · 通知级别",
+			"labelEn": "Waiting-for-answer notification level",
+			"default": "active",
+			"options": [
+				{
+					"value": "active",
+					"label": "普通提示（默认）",
+					"labelEn": "Active (default)"
+				},
+				{
+					"value": "timeSensitive",
+					"label": "时效性通知",
+					"labelEn": "Time-sensitive"
+				},
+				{
+					"value": "critical",
+					"label": "关键通知 / 静音穿透（需系统授权）",
+					"labelEn": "Critical / bypass mute (requires system permission)"
+				}
+			],
+			"hint": "模型调用 ask_user_question / ask_user，正在等你回答。须开启「模型提问提醒」；不受档位或时长限制，同一提问不重推。 选择关键通知需在 iOS/Bark 开启关键通知权限；缺省或非法值按普通提示处理。"
+		},
+		{
+			"key": "serviceLevel",
+			"type": "select",
+			"label": "服务提示 · 通知级别",
+			"labelEn": "Service notification level",
+			"default": "active",
+			"options": [
+				{
+					"value": "active",
+					"label": "普通提示（默认）",
+					"labelEn": "Active (default)"
+				},
+				{
+					"value": "timeSensitive",
+					"label": "时效性通知",
+					"labelEn": "Time-sensitive"
+				},
+				{
+					"value": "critical",
+					"label": "关键通知 / 静音穿透（需系统授权）",
+					"labelEn": "Critical / bypass mute (requires system permission)"
+				}
+			],
+			"hint": "插件上线回执（包括能力受限提示）和手动测试 /test。外部 /send 与 AI 工具不继承此项，逐条指定 level，缺省普通提示。 选择关键通知需在 iOS/Bark 开启关键通知权限；缺省或非法值按普通提示处理。"
 		},
 		{
 			"key": "detail",
@@ -83,7 +209,7 @@
 				{ "value": "on", "label": "开：模型调提问工具就推（默认）", "labelEn": "On: push when the model asks (default)" },
 				{ "value": "off", "label": "关", "labelEn": "Off" }
 			],
-			"hint": "模型调 ask_user_question 时整个回合阻塞在你这边，任务不会自己往下走，所以按 critical 推且不受档位与时长限制（同一提问不重推）。回答之后不补发通知，等待时长写进本轮完成通知的「中途等你 X」一行。选项文字插件侧拿不到（宿主 onToolEvent 不带 args、快照里 marker 已被剥），需点推送回 cockpit 查看。"
+			"hint": "模型调 ask_user_question 时整个回合阻塞在你这边，任务不会自己往下走，所以按「等待回答 · 通知级别」推送且不受档位与时长限制（同一提问不重推）。回答之后不补发通知，等待时长写进本轮完成通知的「中途等你 X」一行。选项文字插件侧拿不到（宿主 onToolEvent 不带 args、快照里 marker 已被剥），需点推送回 cockpit 查看。"
 		},
 		{
 			"key": "minRunMinutes",
@@ -109,7 +235,7 @@
 			"type": "text",
 			"label": "通知图标 URL（默认空）",
 			"labelEn": "Icon URL (empty by default)",
-			"hint": "默认留空 = 用 Bark App 自己的默认图标。想固定换图再填：≥150×150 PNG，否则 critical 级的附件图会被 APNs 丢。"
+			"hint": "默认留空 = 用 Bark App 自己的默认图标。想固定换图再填：≥150×150 PNG，否则附件图可能被 APNs 丢。"
 		}
 	]
 }

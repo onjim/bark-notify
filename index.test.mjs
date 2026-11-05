@@ -18,17 +18,17 @@ describe("classifyEvent", () => {
 		assert.equal(note.level, "active");
 	});
 
-	it("error 收尾 → fail + critical（穿透静音）", () => {
+	it("error 收尾 → fail + 普通提示", () => {
 		const note = classifyEvent({ type: "run_end", stopReason: "error" }, { project: "api" });
 		assert.equal(note.kind, "fail");
-		assert.equal(note.level, "critical");
+		assert.equal(note.level, "active");
 		assert.equal(note.sound, "crow");
 	});
 
-	it("截断收尾 → warn 级 timeSensitive", () => {
+	it("截断收尾 → warn 级普通提示", () => {
 		const note = classifyEvent({ type: "run_end", stopReason: "length" }, {});
 		assert.equal(note.kind, "fail");
-		assert.equal(note.level, "timeSensitive");
+		assert.equal(note.level, "active");
 	});
 
 	it("噪声事件一律不推（防刷屏）", () => {
@@ -577,9 +577,9 @@ describe("锁屏信息量（detail 三档）", () => {
 		assert.match(n.body, /会话 abcd1234 · 1 轮/);
 	});
 
-	it("出错时 critical 不变，standard 把摘要与产出排上去", () => {
+	it("出错时仍为普通提示，standard 把摘要与产出排上去", () => {
 		const n = classifyEvent({ type: "run_end", stopReason: "error" }, { ...base, durationMs: 9000, detail: "standard", stats, git: { branch: "fix", dirty: 1 } });
-		assert.equal(n.level, "critical");
+		assert.equal(n.level, "active");
 		assert.equal(n.title, "❌ app · 中断(error) · 9s · 2 文件");
 		assert.match(n.body, /fix\* · 4 次工具 · 测试通过/);
 	});
@@ -635,10 +635,10 @@ describe("等回答提醒（ask_user_question → 回合阻塞）", () => {
 		return { host, got };
 	}
 
-	it("askNote：critical + campaign，文案说清在等你", () => {
+	it("askNote：active + campaign，文案说清在等你", () => {
 		const n = askNote("app");
 		assert.equal(n.kind, "ask");
-		assert.equal(n.level, "critical");
+		assert.equal(n.level, "active");
 		assert.equal(n.sound, "campaign");
 		assert.equal(n.title, "⏳ app · 等你回答");
 	});
@@ -692,5 +692,360 @@ describe("等回答提醒（ask_user_question → 回合阻塞）", () => {
 		await nap(100);
 		assert.equal(a.got.length, 0);
 		assert.equal(b.got.length, 0);
+	});
+});
+
+// ── 真宿主形状回归 ──
+// 夹具严格照 dist/server/serialize.js 下发给插件的形状：toolCall 参数是 JSON 字符串
+// argumentsText（serialize.js:161-172），工具结果是独立消息 role:"toolResult"（:385-392）。
+// 自造形状（input:{path}、块内 toolResult）会让 files 恒空、分支恒缺，测试却全绿——本节就是那张网。
+const REAL_SNAP = () => ({
+	cwd: "/home/dev/repos/app",
+	title: "SSO 改造",
+	messages: [
+		{ id: "m1", role: "user", content: [{ type: "text", text: "把登录改成 SSO" }], timestamp: 1_700_000_000_000 },
+		{
+			id: "m2",
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "先看现状" },
+				{ type: "toolCall", id: "t1", name: "read", argumentsText: "{\"path\":\"/home/dev/repos/app/src/auth.ts\"}" },
+				{ type: "toolCall", id: "t2", name: "edit", argumentsText: "{\"path\":\"/home/dev/repos/app/src/auth.ts\"}" },
+				{ type: "toolCall", id: "t3", name: "bash", argumentsText: "{\"command\":\"npm test\"}" },
+				{ type: "toolCall", id: "t4", name: "write", argumentsText: "{\"file_path\":\"/home/dev/repos/app/src/sso.ts\"}" },
+				{ type: "text", text: "已把登录改为 SSO，并接好回调。\n\n下一步：请在测试环境验证回调域名。" },
+			],
+			stopReason: "end_turn",
+		},
+		{ id: "m3", role: "toolResult", toolCallId: "t3", toolName: "bash", content: [{ type: "text", text: "Tests 12 passed" }], isError: false },
+	],
+});
+
+describe("真宿主形状回归（serialize.js / plugins.js 实测口径）", () => {
+	const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+	const base = { project: "app", durationMs: 65_000, convId: "abcd1234" };
+
+	function boot(over = {}) {
+		const host = createMockHost({
+			settings: { server: "https://example.com", barkKey: "MOCK", webBase: "https://cockpit.test", mode: "all", minRunMinutes: 0, dedupSec: 0, askAlert: "on", ...over },
+		});
+		host.storage.set("boot:lastPing", Date.now());
+		host.requestPermission = async () => true;
+		host.getActiveConversation = () => REAL_SNAP();
+		const got = [];
+		host.net.fetch = async (_u, init) => { got.push(JSON.parse(init.body)); return { ok: true, status: 200, text: '{"code":200}' }; };
+		return { host, got };
+	}
+
+	it("toolCall 参数是 JSON 字符串也能抠出文件清单（P0-1）", () => {
+		const st = summarizeTurn(REAL_SNAP());
+		assert.deepEqual(st.files, ["src/auth.ts", "src/sso.ts"]);
+		assert.equal(st.toolCalls, 4);
+		assert.equal(st.testLine, "测试通过");
+		const n = classifyEvent({ type: "run_end", stopReason: "end_turn" }, { ...base, detail: "standard", stats: st, git: { branch: "main", dirty: 2 } });
+		assert.equal(n.title, "✅ app · 任务完成 · 1m05s · 2 文件");
+		assert.match(n.body, /改了 2 个: src\/auth\.ts, src\/sso\.ts/);
+	});
+
+	it("超大参数被宿主截断（argumentsTruncated）时正则兜底抠 path", () => {
+		const st = summarizeTurn({
+			cwd: "/x",
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }] },
+				{ role: "assistant", content: [{ type: "toolCall", name: "write", argumentsText: "{\"path\":\"/x/a/b/c.ts\",\"content\":\"超大内容", argumentsTruncated: true }] },
+			],
+		});
+		assert.deepEqual(st.files, ["b/c.ts"]);
+	});
+
+	it("manifest 声明了 fs/fs:read，否则 host.scm.status 会被宿主抛错拒掉（P0-2）", async () => {
+		const manifest = JSON.parse(await readFile(new URL("./manifest.json", import.meta.url), "utf8"));
+		assert.ok(manifest.permissions.includes("fs:read") || manifest.permissions.includes("fs"),
+			"scm.status 需要 fs/fs:read（plugins.js:3996-4003）；缺它分支行恒不出现，且 /ping 的 caps 探不出来");
+	});
+
+	it("/ping 权限诊断与 manifest 同步包含 fs:read", async () => {
+		const { host } = boot({ detail: "minimal" });
+		await plugin.activate(host);
+		const route = host.mock.routes.find((r) => (r.path || r[1]) === "/ping");
+		let body = "";
+		(route?.handler || route?.[2])?.({}, { writeHead: () => {}, end: (s) => { body = s; } });
+		assert.ok(JSON.parse(body).permissions.includes("fs:read"));
+	});
+
+	it("run 起始时间划窗不会被追加 steer 截空，也不会携带旧历史", () => {
+		const st = summarizeTurn({ messages: [
+			{ role: "user", timestamp: 100, content: [{ type: "text", text: "旧问题" }] },
+			{ role: "assistant", timestamp: 110, content: [{ type: "toolCall", name: "write", input: { path: "/x/old.ts" } }] },
+			{ role: "user", timestamp: 120, content: [{ type: "text", text: "继续" }] },
+			{ role: "assistant", timestamp: 130, content: [{ type: "text", text: "已完成。" }] },
+		]}, { sinceMs: 105 });
+		assert.deepEqual(st.files, ["x/old.ts"]);
+		assert.match(st.lastText, /已完成/);
+	});
+
+	it("摘要与 payload 对常见凭据做脱敏，并按代码点截断", () => {
+		const st = summarizeTurn({ messages: [
+			{ role: "user", content: [{ type: "text", text: "q" }] },
+			{ role: "assistant", content: [{ type: "text", text: "已完成。token=super-secret-value" }] },
+		] });
+		assert.doesNotMatch(st.lastText, /super-secret/);
+		const p = buildPayload({ barkKey: "K" }, { title: "t", body: "token=top-secret-value 😀" });
+		assert.doesNotMatch(p.body, /top-secret/);
+	});
+
+	it("端到端 standard：真形状快照 + scm.status → 分支与文件数都上屏", async () => {
+		const { host, got } = boot({ detail: "standard" });
+		host.scm = { status: async () => ({ notRepo: false, branch: "main", files: [{ path: "src/auth.ts" }, { path: "src/sso.ts" }] }) };
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "end_turn", conversationId: "c1", sessionId: "s1" });
+		await nap(80);
+		assert.equal(got.length, 1);
+		assert.match(got[0].title, /· 2 文件/);
+		assert.match(got[0].body, /main\* · 4 次工具 · 测试通过/);
+	});
+
+	it("scm 被门控抛错：只少分支这一行，推送照发", async () => {
+		const { host, got } = boot({ detail: "standard" });
+		host.scm = { status: async () => { throw new Error('插件未声明读能力 "fs"/"fs:read"（manifest.permissions）——请求被拒'); } };
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "end_turn", conversationId: "c1", sessionId: "s1" });
+		await nap(80);
+		assert.equal(got.length, 1);
+		assert.equal(got[0].body.includes("main*"), false);
+		assert.match(got[0].body, /改了 2 个/);
+	});
+
+	it("minimal 档不碰 git：scm.status 零调用", async () => {
+		const { host, got } = boot({ detail: "minimal" });
+		let called = 0;
+		host.scm = { status: async () => { called++; return { branch: "main", files: [] }; } };
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "end_turn", conversationId: "c1", sessionId: "s1" });
+		await nap(80);
+		assert.equal(got.length, 1);
+		assert.equal(called, 0);
+	});
+
+	it("dedupSec=300：另一条会话的提问照推，同 toolCallId 重放不重推（P1-3）", async () => {
+		const { host, got } = boot({ dedupSec: 300 });
+		await plugin.activate(host);
+		host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "cA", toolCallId: "q1" });
+		host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "cA", toolCallId: "q1" });
+		host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "cB", toolCallId: "q2" });
+		await nap(150);
+		assert.equal(got.length, 2, "同会话同一提问只推一次；不同提问不能被正文相同的去重吞掉");
+	});
+
+	it("一轮内两次提问：「中途等你」求和（P1-4）", async () => {
+		const { host, got } = boot();
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "c1", sessionId: "s1" });
+		host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "c1", toolCallId: "t1" });
+		host.mock.emit("onToolEvent", { phase: "end", toolName: "ask_user_question", conversationId: "c1", toolCallId: "t1", durationMs: 8000, isError: false });
+		host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "c1", toolCallId: "t2" });
+		host.mock.emit("onToolEvent", { phase: "end", toolName: "ask_user_question", conversationId: "c1", toolCallId: "t2", durationMs: 5000, isError: false });
+		host.mock.emit("onRunEvent", { type: "run_end", stopReason: "end_turn", conversationId: "c1", sessionId: "s1" });
+		await nap(200);
+		const done = got[got.length - 1];
+		assert.match(done.title, /任务完成/);
+		assert.match(done.body, /中途等你 13s/);
+	});
+
+	it("ask 事件不带 sessionId：用 run 事件回填的会话拼深链（P1-5）", async () => {
+		const { host, got } = boot();
+		await plugin.activate(host);
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "c1", sessionId: "s9" });
+		host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "c1", toolCallId: "t1" });
+		await nap(100);
+		assert.equal(got.length, 1);
+		assert.match(got[0].url, /#s=s9$/);
+	});
+
+	it("dedupeKey：dedupSeed 让固定文案按事件区分，无 seed 时同内容仍去重", () => {
+		const a = { kind: "ask", title: "⏳ app · 等你回答", body: "b" };
+		assert.notEqual(dedupeKey({ ...a, dedupSeed: "cA:q1" }), dedupeKey({ ...a, dedupSeed: "cB:q2" }));
+		assert.equal(dedupeKey({ ...a, dedupSeed: "cA:q1" }), dedupeKey({ ...a, dedupSeed: "cA:q1" }));
+		assert.equal(dedupeKey(a), `${a.kind}|manual|active|${a.title}|${a.body}`);
+	});
+});
+
+
+describe("按触发条件配置通知级别", () => {
+	const levels = ["active", "timeSensitive", "critical"];
+	const settingsByCategory = {
+		completion: "completionLevel", interruption: "interruptionLevel",
+		truncation: "truncationLevel", question: "questionLevel", service: "serviceLevel",
+	};
+	const settle = () => new Promise((resolve) => setImmediate(resolve));
+	async function boot(settings = {}, { receipt = false, degraded = false } = {}) {
+		const host = createMockHost({ settings: {
+			server: "https://api.day.app", barkKey: "MOCK", mode: "all",
+			minRunMinutes: 0, dedupSec: 0, ...settings,
+		} });
+		if (!receipt) host.storage.set("boot:lastPing", Date.now());
+		if (degraded) host.secrets.has = () => { throw new Error("permission denied"); };
+		const got = [];
+		host.net.fetch = async (_url, init) => {
+			got.push(JSON.parse(init.body));
+			return { status: 200, text: '{"code":200}' };
+		};
+		await plugin.activate(host);
+		await settle();
+		return { host, got };
+	}
+	function request(host, method, path, extra = {}) {
+		const route = host.mock.routes.find((r) => r.method === method && r.path === path);
+		assert.ok(route, method + " " + path);
+		return new Promise((resolve) => {
+			let status;
+			route.handler({ headers: { "content-type": "application/json" }, ...extra }, {
+				writeHead: (code) => { status = code; },
+				end: (text) => resolve({ status, body: JSON.parse(text) }),
+			});
+		});
+	}
+	async function trigger(host, category) {
+		if (category === "service") return request(host, "POST", "/test");
+		if (category === "question") host.mock.emit("onToolEvent", { phase: "start", toolName: "ask_user_question", conversationId: "c1", toolCallId: "q1" });
+		else host.mock.emit("onRunEvent", { type: "run_end", conversationId: "c1", stopReason: { completion: "end_turn", interruption: "aborted", truncation: "length" }[category] });
+		await settle();
+	}
+
+	it("所有已知 stopReason、错误事件和提问都有明确分类", () => {
+		for (const stopReason of ["end_turn", "stop", "unknown"]) assert.equal(classifyEvent({ type: "run_end", stopReason }).category, "completion");
+		for (const stopReason of ["error", "aborted", "abort", "cancelled", "canceled", "timeout", "refusal"]) assert.equal(classifyEvent({ type: "run_end", stopReason }).category, "interruption");
+		for (const stopReason of ["length", "max_tokens", "context_length", "content_filter"]) assert.equal(classifyEvent({ type: "run_end", stopReason }).category, "truncation");
+		for (const type of ["run_error", "agent_error"]) assert.equal(classifyEvent({ type }).category, "interruption");
+		assert.equal(askNote("app").category, "question");
+	});
+
+	it("manifest 五类都可选三档，默认普通；保持现有宿主权限", async () => {
+		const manifest = JSON.parse(await readFile(new URL("./manifest.json", import.meta.url), "utf8"));
+		for (const key of Object.values(settingsByCategory)) {
+			const s = manifest.settings.find((s) => s.key === key);
+			assert.ok(s, key);
+			assert.equal(s.type, "select");
+			assert.equal(s.default, "active");
+			assert.deepEqual(s.options.map((o) => o.value), levels);
+		}
+		assert.ok(manifest.permissions.includes("fs:read"));
+	});
+
+	for (const [category, key] of Object.entries(settingsByCategory)) {
+		for (const level of levels) it(category + " 配置 " + level + "：真实发送入口、/ping 与投递记录一致", async () => {
+			const { host, got } = await boot({ [key]: level });
+			await trigger(host, category);
+			assert.equal(got.length, 1);
+			assert.equal(got[0].level, level);
+			const ping = await request(host, "GET", "/ping");
+			assert.deepEqual(ping.body.levels, Object.fromEntries(Object.keys(settingsByCategory).map((c) => [c, c === category ? level : "active"])));
+			const status = await request(host, "GET", "/status");
+			assert.equal(status.body.recent[0].category, category);
+			assert.equal(status.body.recent[0].level, level);
+			assert.equal(status.body.recent[0].result, "sent");
+		});
+	}
+
+	it("缺省与非法设置均回退普通；不会升级任何自动通知", async () => {
+		for (const value of [undefined, "", null, {}, "CRITICAL", "passive"]) {
+			const { host, got } = await boot(Object.fromEntries(Object.values(settingsByCategory).map((k) => [k, value])));
+			for (const category of Object.keys(settingsByCategory)) await trigger(host, category);
+			assert.equal(got.length, 5);
+			assert.ok(got.every((p) => p.level === "active"));
+		}
+	});
+
+	it("五类可同时独立设置，互不覆盖", async () => {
+		const { host, got } = await boot({ completionLevel: "active", interruptionLevel: "critical", truncationLevel: "timeSensitive", questionLevel: "critical", serviceLevel: "active", dedupSec: 300 });
+		for (const category of Object.keys(settingsByCategory)) await trigger(host, category);
+		assert.deepEqual(got.map((p) => p.level), ["active", "critical", "timeSensitive", "critical", "active"]);
+	});
+
+	it("修改设置即时生效且不被旧级别去重；同级别重复仍被去重", async () => {
+		const { host, got } = await boot({ completionLevel: "active", dedupSec: 300 });
+		await trigger(host, "completion");
+		host.mock.emitSettings({ completionLevel: "critical" });
+		await trigger(host, "completion");
+		assert.deepEqual(got.map((p) => p.level), ["active", "critical"]);
+		await trigger(host, "completion");
+		assert.equal(got.length, 2, "同分类同级别同文案仍正常去重");
+	});
+
+	it("关键级别不能绕过档位、时长和提问开关；异常与提前收尾不受时长限制", async () => {
+		const { host, got } = await boot({ mode: "important", minRunMinutes: 5, askAlert: "off", completionLevel: "critical", interruptionLevel: "critical", truncationLevel: "timeSensitive", questionLevel: "critical" });
+		await trigger(host, "completion");
+		await trigger(host, "question");
+		assert.equal(got.length, 0);
+		host.mock.emitSettings({ mode: "all" });
+		await trigger(host, "completion"); // 未捕获开始时间
+		host.mock.emit("onRunEvent", { type: "run_start", conversationId: "c1" });
+		await trigger(host, "completion"); // 短运行
+		assert.equal(got.length, 0);
+		await trigger(host, "interruption");
+		await trigger(host, "truncation");
+		assert.deepEqual(got.map((p) => p.level), ["critical", "timeSensitive"]);
+	});
+
+	it("提问别名也使用等待级别，同一 toolCallId 不重推；回答不补发", async () => {
+		const { host, got } = await boot({ mode: "important", minRunMinutes: 5, questionLevel: "critical" });
+		const event = { phase: "start", toolName: "ask_user", conversationId: "c2", toolCallId: "q2" };
+		host.mock.emit("onToolEvent", event);
+		host.mock.emit("onToolEvent", event);
+		await settle();
+		host.mock.emit("onToolEvent", { ...event, phase: "end", durationMs: 1000 });
+		await settle();
+		assert.equal(got.length, 1);
+		assert.equal(got[0].level, "critical");
+	});
+
+	it("正常/能力受限上线回执都用服务级别，不跟随完成或提问；保留上线节流", async () => {
+		for (const degraded of [false, true]) {
+			const { host, got } = await boot({ completionLevel: "critical", questionLevel: "critical", serviceLevel: "timeSensitive" }, { receipt: true, degraded });
+			assert.equal(got.length, 1);
+			assert.equal(got[0].level, "timeSensitive");
+			assert.match(got[0].title, degraded ? /能力被拒/ : /已加载/);
+			await plugin.activate(host);
+			await settle();
+			assert.equal(got.length, 1);
+		}
+	});
+
+	it("/send 的 GET/POST 和 AI 工具逐条选择级别，不继承自动分类设置", async () => {
+		const { host, got } = await boot(Object.fromEntries(Object.values(settingsByCategory).map((k) => [k, "critical"])));
+		const tool = host.mock.agentTools.find((t) => t.name === "bark_notify");
+		assert.deepEqual(tool.parameters.properties.level.enum, levels);
+		for (const level of [...levels, undefined, "bogus"]) {
+			const expected = levels.includes(level) ? level : "active";
+			await request(host, "POST", "/send", { body: { title: "manual", level } });
+			assert.equal(got.at(-1).level, expected);
+			await request(host, "GET", "/send", { url: "/send?title=manual" + (level === undefined ? "" : "&level=" + level) });
+			assert.equal(got.at(-1).level, expected);
+			await tool.execute("call1", { title: "manual", level });
+			assert.equal(got.at(-1).level, expected);
+			await tool.execute({ title: "manual", level }); // 兼容旧宿主签名
+			assert.equal(got.at(-1).level, expected);
+		}
+		assert.equal(got.length, 20);
+	});
+
+	it("静默归档优先于关键级别：payload、HTTP 与 AI 都不穿透静音", async () => {
+		const note = { title: "quiet", body: "b", level: "critical", sound: "crow", archived: true };
+		assert.equal(buildPayload({ barkKey: "K" }, note).level, "active");
+		assert.equal(buildPayload({ barkKey: "K" }, note).sound, "silence");
+		assert.equal(buildPayload({ barkKey: "K", levels: { question: "critical" } }, { ...note, category: "question" }).level, "active");
+		const { host, got } = await boot();
+		await request(host, "POST", "/send", { body: note });
+		await request(host, "GET", "/send", { url: "/send?title=quiet&level=critical&quiet=1" });
+		await host.mock.agentTools[0].execute("call1", { title: "quiet", level: "critical", quiet: true });
+		assert.equal(got.length, 3);
+		assert.ok(got.every((p) => p.level === "active" && p.sound === "silence" && p.archived === true));
+	});
+
+	it("去重包含分类与级别；空级别等价普通", () => {
+		const note = { kind: "fail", title: "same", body: "same", category: "interruption", level: "active" };
+		assert.notEqual(dedupeKey(note), dedupeKey({ ...note, category: "truncation" }));
+		assert.notEqual(dedupeKey(note), dedupeKey({ ...note, level: "critical" }));
+		assert.equal(dedupeKey(note), dedupeKey({ ...note, level: undefined }));
 	});
 });

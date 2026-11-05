@@ -2,8 +2,8 @@
  * bark-notify — 任务事件 → Bark 推送（服务端入口）
  *
  * 只做两件事：
- *   1. 分级：把宿主 run 事件映射成 done / fail 两档，声音即优先级
- *      （glass=完成 · crow+critical=出错）。
+ *   1. 分类：完成 / 异常中断 / 提前收尾 / 等待回答 / 服务提示，声音区分类型，
+ *      每类独立配置 active / timeSensitive / critical（默认普通提示）。
  *   2. 投递：POST <server>/push + snake_case `device_key`。中文/emoji/换行原生支持，
  *      不需要 URL 编码 —— 这类精简版 bark-server 的 GET 路径式虽返 200，但走
  *      jq '@uri' 拼 URL 时非 ASCII 会变成字面量 "null"（踩过），故统一走 POST。
@@ -34,11 +34,24 @@ export function pickProject(snap) {
 
 const SHORT_TITLE = 78;
 const SHORT_BODY = 480;
+const LEVELS = new Set(["active", "timeSensitive", "critical"]);
+const normalizeLevel = (value) => LEVELS.has(value) ? value : "active";
+// 自动通知按分类设置；手动推送逐条指定。静默归档优先，不得因 critical 穿透静音。
+const levelOf = (cfg, note) => note.archived ? "active" : normalizeLevel(note.category ? cfg.levels?.[note.category] : note.level);
 
 const clip = (value, max) => {
 	const text = String(value ?? "").replace(/[ \t]+\n/g, "\n").trim();
-	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+	if ([...text].length <= max) return text;
+	return `${[...text].slice(0, max - 1).join("")}…`;
 };
+/** 推送正文来自会话/工具输出，先做最小化脱敏，避免把常见凭据带到 Bark。 */
+export function redactText(value) {
+	return String(value ?? "")
+		.replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "‹redacted›")
+		.replace(/\b(?:(?:ghp|gho|ghs|github_pat)_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/g, "‹redacted›")
+		.replace(/\bAKIA[0-9A-Z]{16}\b/g, "‹redacted›")
+		.replace(/((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[=:]\s*)([^\s,;]+)/gi, "$1‹redacted›");
+}
 /** 数字设置取值：空串/非法 → 默认值；0 是显式合法值（如「不限时长」），与清空区分。 */
 export function numSet(value, dflt) {
 	const t = String(value ?? "").trim();
@@ -67,7 +80,28 @@ const blocksOf = (msg) => (Array.isArray(msg?.content) ? msg.content : []);
 const isToolCall = (b) => Boolean(b && (b.type === "toolCall" || b.type === "tool_use" || b.type === "tool-call"));
 const isToolResult = (b) => Boolean(b && (b.type === "toolResult" || b.type === "tool_result" || b.type === "tool-result"));
 const toolNameOf = (b) => String(b?.name ?? b?.toolName ?? b?.tool ?? "").trim();
-const toolArgsOf = (b) => { const a = b?.input ?? b?.args ?? b?.arguments ?? b?.params ?? b?.parameters; return a && typeof a === "object" ? a : {}; };
+/**
+ * 工具参数取对象：自造/mock 夹具给对象（input/args/…），真宿主给的是 **JSON 字符串**
+ * `argumentsText`（serialize.js:161-172），只认对象会让文件清单在真机恒为空。
+ * 超大参数宿主会截断（argumentsTruncated）→ JSON.parse 失败，退化成正则抠 path。
+ */
+const PATH_KEY_RE = /"(?:path|file_path|filePath|target|filename|notebook_path)"\s*:\s*("(?:\\.|[^"\\]){1,400}")/;
+const toolArgsOf = (b) => {
+	const a = b?.input ?? b?.args ?? b?.arguments ?? b?.params ?? b?.parameters;
+	if (a && typeof a === "object") return a;
+	if (typeof b?.argumentsText === "string") {
+		try {
+			const o = JSON.parse(b.argumentsText);
+			if (o && typeof o === "object") return o;
+		} catch {
+			if (b.argumentsTruncated === true) {
+				const m = b.argumentsText.match(PATH_KEY_RE);
+				if (m) { try { return { path: JSON.parse(m[1]) }; } catch { /* 不猜损坏的转义 */ } }
+			}
+		}
+	}
+	return {};
+};
 const textOf = (b) => (b && b.type === "text" && typeof b.text === "string" ? b.text : "");
 const resultTextOf = (b) => (isToolResult(b) ? blocksOf(b).map(textOf).join("\n") || (typeof b?.text === "string" ? b.text : "") : "");
 
@@ -77,15 +111,23 @@ export function firstSentence(value, max = 72) {
 	if (!t) return "";
 	const m = t.match(/^.{1,300}?(?:[。！？!?;；]|\.\s|$)/);   // 保留句末标点，锁屏读起来自然
 	const sent = (m ? m[0] : t).trim();
-	return sent.length > max ? `${sent.slice(0, max - 1)}…` : sent;
+	return clip(sent, max);
 }
 
 const WRITE_TOOLS = new Set(["edit", "write", "patch", "multi_edit", "multiedit", "create_file", "apply_patch", "str_replace", "notebookedit", "notebook_edit", "search_replace"]);
 const BASH_TOOLS = new Set(["bash", "shell", "exec", "run_command", "powershell", "terminal"]);
+const TEST_PASS = /测试通过|全部通过|all tests? passed|tests?\s+\d+\s+pass|✓\s*\d+\s*pass|(?:#\s*)?pass\s+[1-9]\d*/i;
+const TEST_FAIL = /测试失败|tests?\s+failed|failing\s+[1-9]\d*|\b[1-9]\d*\s+failed|(?:#\s*)?fail\s+[1-9]\d*\b|npm ERR/i;
+const TEST_COMMAND = /\b(?:test|pytest|vitest|jest|mocha|unittest|ctest)\b|--test\b/i;
 
-/** 本轮 = 最近一条 user 消息之后的所有消息；找不到 user 就全部。 */
-function turnWindow(messages) {
+/** 有 run_start 与消息时间戳时按运行边界划窗，避免 steer 截掉本轮前半段。
+ *  缺时间戳时才退回最后一条 user；不能向前猜测，否则会把上一轮产出串进来。 */
+function turnWindow(messages, sinceMs) {
 	const list = Array.isArray(messages) ? messages : [];
+	if (Number.isFinite(sinceMs) && list.length && list.every((m) => Number.isFinite(m?.timestamp))) {
+		const current = list.filter((m) => m.timestamp >= sinceMs);
+		if (current.length) return current;
+	}
 	for (let i = list.length - 1; i >= 0; i--) { if (String(list[i]?.role || "").toLowerCase() === "user") return list.slice(i + 1); }
 	return list;
 }
@@ -94,44 +136,56 @@ function turnWindow(messages) {
  * 快照 → 本轮产出：碰了哪些文件、多少次工具、测试结论、末句回答、下一步。
  * 字段全为可选语义（拿不到就是空），调用侧靠 filter(Boolean) 拼行。
  */
-export function summarizeTurn(snap) {
-	const win = turnWindow(snap?.messages);
+export function summarizeTurn(snap, { sinceMs } = {}) {
+	const win = turnWindow(snap?.messages, sinceMs);
 	const files = [];
 	const seen = new Set();
-	const hay = [];
+	const testCalls = new Set();
+	let testLine = "";
 	let toolCalls = 0, writeCalls = 0, bashCalls = 0;
+	let previousCall = null;
+	const collectResult = (result, text, call) => {
+		// read 返回的文档、助手自述不能充当测试证据。失败优先，防止同轮混合输出掩盖失败。
+		if (!call?.isTest) return;
+		const failed = result?.isError === true || (Number.isFinite(result?.details?.exitCode) && result.details.exitCode !== 0) || TEST_FAIL.test(text);
+		if (failed) testLine = "测试失败";
+		else if (testLine !== "测试失败" && TEST_PASS.test(text)) testLine = "测试通过";
+	};
 	for (const msg of win) {
+		// 真宿主把工具结果放在独立消息；按 toolCallId 关联测试命令，不把 read 当测试。
+		if (String(msg?.role || "").toLowerCase() === "toolresult") {
+			collectResult(msg, blocksOf(msg).map(textOf).join("\n"), { isTest: testCalls.has(String(msg.toolCallId ?? msg.id ?? "")) });
+		}
 		for (const b of blocksOf(msg)) {
 			if (isToolCall(b)) {
 				toolCalls++;
 				const name = toolNameOf(b).toLowerCase();
 				const args = toolArgsOf(b);
-				const p = String(args.path ?? args.file_path ?? args.filePath ?? args.target ?? args.filename ?? "").trim();
+				const p = String(args.path ?? args.file_path ?? args.filePath ?? args.target ?? args.filename ?? args.notebook_path ?? "").trim();
 				if (WRITE_TOOLS.has(name)) {
 					writeCalls++;
 					if (p && !seen.has(p)) { seen.add(p); files.push(p.replace(/^\.?\/+/, "").split("/").slice(-2).join("/")); }
 				}
 				if (BASH_TOOLS.has(name)) bashCalls++;
+				previousCall = { isTest: BASH_TOOLS.has(name) && TEST_COMMAND.test(String(args.command ?? args.cmd ?? "")) };
+				const callId = b.id ?? b.toolCallId ?? b.callId;
+				if (previousCall.isTest && callId) testCalls.add(String(callId));
 			} else if (isToolResult(b)) {
-				hay.push(resultTextOf(b));
+				collectResult(b, resultTextOf(b), previousCall);
 			}
 		}
-		const t = blocksOf(msg).map(textOf).filter(Boolean).join("\n").trim();
-		if (t) hay.push(t);
 	}
 	const assistants = win.filter((m) => String(m?.role || "").toLowerCase() === "assistant");
-	const lastText = assistants.length ? blocksOf(assistants[assistants.length - 1]).map(textOf).filter(Boolean).join("\n").trim() : "";
-	const all = hay.join("\n");
-	// 只认行首的「下一步：」——实测发现「…和下一步塞进锁屏」这种句中词会被抓成半句
+	const lastTextRaw = assistants.length ? blocksOf(assistants[assistants.length - 1]).map(textOf).filter(Boolean).join("\n").trim() : "";
+	const lastText = redactText(lastTextRaw);
+	// 只从助手文本取下一步，绝不把 read/bash 的整段结果外发；句中「和下一步」不命中。
 	const NEXT_RE = /(?:^|\n)\s*(?:下一步|下步|next step|待确认|需要你确认|请确认)[：: ]*([^\n]{1,80})/i;
-	const next = (lastText || "").match(NEXT_RE) || all.match(NEXT_RE);
-	const testLine = /(?:测试通过|全部通过|all tests? passed|tests?\s+\d+\s+pass|✓\s*\d+\s*pass|pass\s+\d+)/i.test(all)
-		? "测试通过"
-		: (/测试失败|tests?\s+failed|failing\s+\d+|\d+\s+failed|npm ERR/i.test(all) ? "测试失败" : "");
+	const next = lastText.match(NEXT_RE);
+	// 仅传出测试结论，不携带工具日志正文。
 	return {
-		files, writeCalls, bashCalls, toolCalls,
+		files: files.map((p) => redactText(p)), writeCalls, bashCalls, toolCalls,
 		lastText: firstSentence(lastText),
-		nextStep: next ? firstSentence(next[1], 60) : "",
+		nextStep: next ? firstSentence(redactText(next[1]), 60) : "",
 		testLine,
 		turns: assistants.length,
 	};
@@ -155,10 +209,10 @@ export function pickGit(st) {
  */
 export function askNote(project) {
 	return {
-		kind: "ask",
+		kind: "ask", category: "question",
 		title: clip(`⏳ ${project} · 等你回答`, SHORT_TITLE),
 		body: clip("模型提了问题，会话正阻塞在你这边\n回到 cockpit 选一个就能继续", SHORT_BODY),
-		sound: "campaign", level: "critical", archived: false, badge: 1,
+		sound: "campaign", level: "active", archived: false, badge: 1,
 	};
 }
 
@@ -216,10 +270,10 @@ export function classifyEvent(ev, ctx = {}) {
 						detail === "rich" ? `耗时 ${dur || "?"} · 会话 ${ctx.convId || "?"}` : "回 cockpit 看完整轨迹",
 					].filter(Boolean);
 				return {
-					kind: "fail",
+					kind: "fail", category: "interruption",
 					title: titleCore("❌", `中断(${stop})`),
 					body: clip(lines.join("\n"), SHORT_BODY),
-					sound: "crow", level: "critical", archived: false, badge: 1,
+					sound: "crow", level: "active", archived: false, badge: 1,
 				};
 			}
 			if (WARN_STOP.has(stop)) {
@@ -232,10 +286,10 @@ export function classifyEvent(ev, ctx = {}) {
 						`stopReason=${stop}`,
 					].filter(Boolean);
 				return {
-					kind: "fail",
+					kind: "fail", category: "truncation",
 					title: titleCore("⚠️", `提前收尾(${stop})`),
 					body: clip(lines.join("\n"), SHORT_BODY),
-					sound: "bell", level: "timeSensitive", archived: false, badge: 1,
+					sound: "bell", level: "active", archived: false, badge: 1,
 				};
 			}
 			const doneLines = detail === "minimal"
@@ -249,7 +303,7 @@ export function classifyEvent(ev, ctx = {}) {
 					detail === "rich" ? `会话 ${ctx.convId || "?"}${st && st.turns ? ` · ${st.turns} 轮` : ""}` : "",
 				].filter(Boolean);
 			return {
-				kind: "done",
+				kind: "done", category: "completion",
 				title: titleCore("✅", "任务完成"),
 				body: clip(doneLines.join("\n") || (dur || "已完成"), SHORT_BODY),
 				sound: "glass", level: "active", archived: false, badge: 1,
@@ -258,10 +312,10 @@ export function classifyEvent(ev, ctx = {}) {
 		case "run_error":
 		case "agent_error":
 			return {
-				kind: "fail",
+				kind: "fail", category: "interruption",
 				title: clip(`❌ ${proj} · 报错`, SHORT_TITLE),
 				body: clip(clip(ev.error ?? ev.message ?? "未知错误", SHORT_BODY - 40) + (tail ? `\n${tail}` : ""), SHORT_BODY),
-				sound: "crow", level: "critical", archived: false, badge: 1,
+				sound: "crow", level: "active", archived: false, badge: 1,
 			};
 		default:
 			return null; // turn_end / tool_delta / … 一律不推，防刷屏
@@ -274,12 +328,12 @@ export function buildPayload(cfg, note) {
 	if (!key) return null;
 	const payload = {
 		device_key: key,
-		title: note.title,
-		body: note.body || " ",
+		title: clip(redactText(note.title), SHORT_TITLE),
+		body: clip(redactText(note.body || " "), SHORT_BODY) || " ",
 		group: note.group || (note.kind === "ask" ? "pi-ask" : note.kind === "fail" ? "pi-fail" : "pi"),
 		badge: Number.isFinite(note.badge) ? note.badge : 1,
-		sound: note.sound || "glass",
-		level: note.level || "active",
+		sound: note.archived ? "silence" : note.sound || "glass",
+		level: levelOf(cfg, note),
 		archived: Boolean(note.archived),
 	};
 	// 单条图标优先于设置里的 icon；两处都空就不带该字段
@@ -289,9 +343,14 @@ export function buildPayload(cfg, note) {
 	return payload;
 }
 
-/** 去重键：同标题+正文在窗口内只发一次（防故障时连环轰炸）。 */
+/** 去重键：同标题+正文在窗口内只发一次（防故障时连环轰炸）。
+ *  分类与生效级别也参与去重，避免更改级别后被旧级别吞掉。
+ *  dedupSeed 用于「文案固定但语义是每次新事件」的档位——ask 提醒正文写死，
+ *  不带 cid:toolCallId 的话，5 分钟窗口内第二、第三条提问会被当重复静默丢掉，
+ *  而每一次提问都是「回合卡在等人」，漏报＝特性失效（同 toolCallId 由 waitingAsk 兜）。 */
 export function dedupeKey(note) {
-	return `${note.kind || ""}|${note.title}|${note.body}`;
+	const seed = note.dedupSeed ? `|${note.dedupSeed}` : "";
+	return `${note.kind || ""}|${note.category || "manual"}|${normalizeLevel(note.level)}|${note.title}|${note.body}${seed}`;
 }
 
 export default definePlugin({
@@ -299,7 +358,11 @@ export default definePlugin({
 		/** —— 运行时状态（全部内存，重启即清；配置以设置面板为准）—— */
 		const startedAt = new Map();          // conversationId → run 起始 ms
 		const waitingAsk = new Map();         // conversationId → {at, toolCallId}：模型提问中（回合正阻塞）
-		const lastWaitMs = new Map();         // conversationId → 上次等回答花了多久，收尾时补一行「中途等你 X」
+		const lastWaitMs = new Map();         // conversationId → 本轮累计等回答 ms（多次提问求和），收尾时补一行「中途等你 X」
+		const sessionOf = new Map();          // conversationId → sessionId：onToolEvent 不带 sessionId（agent-service.js:4813/4851），靠 run 事件回填
+		const prune = (map, cap = 200) => {
+			if (map.size > cap) for (const k of [...map.keys()].slice(0, map.size - cap)) map.delete(k);
+		};
 		const dedup = new Map();             // hash → 最近投递 ms
 		const recent = [];                  // 最近 20 条投递记录（/status 用）
 
@@ -320,11 +383,18 @@ export default definePlugin({
 				minRunMs: numSet(s.minRunMinutes, 5) * 60_000, // 清空回默认 5 分钟，0 = 不限
 				dedupSec: numSet(s.dedupSec, 300),
 				detail: s.detail === "minimal" || s.detail === "rich" ? s.detail : "standard", // 锁屏信息量
-				askAlert: s.askAlert !== "off", // 模型提问（回合阻塞）提醒：critical，不受 mode 限制
+				askAlert: s.askAlert !== "off", // 模型提问提醒，不受 mode 限制
+				levels: {
+					completion: normalizeLevel(s.completionLevel),
+					interruption: normalizeLevel(s.interruptionLevel),
+					truncation: normalizeLevel(s.truncationLevel),
+					question: normalizeLevel(s.questionLevel),
+					service: normalizeLevel(s.serviceLevel),
+				},
 			};
 		};
 		/** 缺必填项 / 域名不在出站白名单：两条都让人当场看到，而不是默默不发 */
-		const missingCfg = () => ["server", "barkKey"].filter((k) => !String(cfgOf()[k] || "").trim());
+		const missingCfg = (cfg = cfgOf()) => ["server", "barkKey"].filter((k) => !String(cfg[k] || "").trim());
 		/** 已批过 / 已问过的主机：批过的不再打扰，被拒的也不再每轮重弹。 */
 		const netGranted = new Set();
 		const netAsked = new Set();
@@ -390,9 +460,10 @@ export default definePlugin({
 		async function notify(note, opts = {}) {
 			if (!note) return { ok: false, skipped: "no-note" };
 			const cfg = cfgOf();
+			note = { ...note, level: levelOf(cfg, note) };
 			const mode = cfg.mode;
 			const k = dedupeKey(note);
-			const rec = (n, result, extra) => record({ kind: n.kind, title: n.title, result, ...extra });
+			const rec = (n, result, extra) => record({ kind: n.kind, category: n.category || "manual", level: n.level, title: clip(redactText(n.title), SHORT_TITLE), result, ...extra });
 			const release = () => dedup.delete(k); // 试了但没送达 → 释放去重标记，不吞重试机会
 			if (mode === "important" && !opts.force && note.kind === "done") {
 				rec(note, "filtered");
@@ -423,7 +494,7 @@ export default definePlugin({
 				release();
 				return { ok: false, skipped: "configuration-changed" };
 			}
-			const missing = missingCfg();
+			const missing = missingCfg(cfg);
 			if (missing.length) {
 				const tip = `Bark 推送未配置：请填写 ${missing.join(" / ")}（设置 → 界面插件 → Bark 推送）`;
 				host.notify("warning", tip, `Bark not configured: fill ${missing.join(" / ")}`);
@@ -464,12 +535,12 @@ export default definePlugin({
 		async function handleEvent(ev) {
 			if (!ev || typeof ev !== "object" || typeof ev.type !== "string") return;
 			const cid = ev.conversationId || ev.sessionId || ev.clientId || "anon";
+			if (ev.sessionId) { sessionOf.set(cid, String(ev.sessionId)); prune(sessionOf); }
 			if (ev.type === "run_start") {
-				startedAt.set(cid, Date.now());
-				if (startedAt.size > 200) { // 清遗忘键（run 未正常收尾）：只留近 24h
-					const cut = Date.now() - 24 * 3600 * 1000;
-					for (const [kc, vc] of startedAt) { if (vc < cut) startedAt.delete(kc); }
-				}
+				startedAt.set(cid, Number.isFinite(ev.at) ? ev.at : Date.now());
+				lastWaitMs.delete(cid); // 上一轮没走到收尾（崩溃/取消）留下的等待，不串到本轮
+				waitingAsk.delete(cid);
+				prune(startedAt);
 				return;
 			}
 			if (!NOTIFIABLE.has(ev.type)) return;
@@ -482,8 +553,9 @@ export default definePlugin({
 				if (lw !== undefined) { lastWaitMs.delete(cid); waitMs = waitMs === undefined ? lw : waitMs + lw; }
 			}
 			let durationMs;
+			const sinceMs = startedAt.get(cid);
 			{
-				const t0 = startedAt.get(cid);
+				const t0 = sinceMs;
 				startedAt.delete(cid);
 				if (t0 !== undefined) durationMs = Math.max(0, Date.now() - t0);
 			}
@@ -496,7 +568,7 @@ export default definePlugin({
 			let stats = null;
 			let git = null;
 			if (detail !== "minimal") {
-				try { stats = summarizeTurn(snap); } catch { /* 摘要尽力而为 */ }
+				try { stats = summarizeTurn(snap, { sinceMs }); } catch { /* 摘要尽力而为 */ }
 				try {
 					const st = typeof host.scm?.status === "function" ? await host.scm.status() : null;
 					git = pickGit(st);
@@ -522,30 +594,33 @@ export default definePlugin({
 		async function handleToolEvent(raw) {
 			if (!raw || typeof raw !== "object") return;
 			const ev = raw;
-			const name = String(ev.toolName ?? "");
+			const name = String(ev.toolName ?? "").trim().toLowerCase();
 			if (name !== "ask_user_question" && name !== "ask_user") return;
-			if (!cfgOf().askAlert) return;
+			if (ev.phase === "start" && !cfgOf().askAlert) return;
 			const cid = ev.conversationId || ev.sessionId || ev.clientId || "anon";
 			if (ev.phase === "start") {
 				const callId = String(ev.toolCallId ?? "");
 				if (waitingAsk.get(cid)?.toolCallId === callId) return;
 				waitingAsk.set(cid, { at: Date.now(), toolCallId: callId });
+				prune(waitingAsk);
 				let snap = null;
 				try {
 					snap = host.getActiveConversation({ clientId: ev.clientId }) || host.getActiveConversation();
 				} catch { /* 拿快照取项目名，拿不到就兜底 */ }
 				const note = askNote(pickProject(snap));
 				note.group = "pi-ask";
-				note.sessionId = ev.sessionId || ""; // 点推送直达正在等人的那条会话
+				note.dedupSeed = `${cid}:${callId}`; // 文案固定，靠 seed 区分每一次提问
+				note.sessionId = String(ev.sessionId || sessionOf.get(cid) || ""); // 点推送直达正在等人的那条会话（onToolEvent 无 sessionId → 用 run 事件回填的值）
 				await notify(note, { force: true });  // 强制通道：不受 mode / 时长过滤限制
 			}
 			// phase === "end"：不推新通知（你都回了，再推就是打饫），只记账
 			if (ev.phase === "end") {
 				const w = waitingAsk.get(cid);
+				if (!w || (ev.toolCallId && w.toolCallId !== String(ev.toolCallId))) return;
 				waitingAsk.delete(cid);
-				if (!w) return;
 				const ms = Number.isFinite(ev.durationMs) ? Math.max(0, Number(ev.durationMs)) : Math.max(0, Date.now() - w.at);
-				lastWaitMs.set(cid, ms);
+				lastWaitMs.set(cid, (lastWaitMs.get(cid) ?? 0) + ms); // 一轮内多次提问：求和，不是只留最后一次
+				prune(lastWaitMs);
 			}
 		}
 
@@ -577,15 +652,17 @@ export default definePlugin({
 		probe("schedule", () => (typeof host.schedule === "function" ? "ok" : "missing（无能力族，靠自然可用）"));
 		probe("net", () => (typeof host.net?.fetch === "function" || typeof host.fetch === "function" ? "ok" : "missing"));
 		probe("ui", () => (typeof host.ui === "object" ? "ok" : "missing"));
+		// scm 要 fs/fs:read（plugins.js:3996-4003 未声明即抛错）：分支行靠它，必须探，否则 /ping 报 9/9 而分支恒缺
+		probe("scm", () => (typeof host.scm?.status === "function" ? "ok" : "missing（宿主无 scm，分支行不会出现）"));
 		const capsBlocked = Object.entries(caps).filter(([, v]) => v !== "ok");
 
 		/** —— 外部/手机回环 HTTP（挂在 /plugins-api/bark-notify/*）—— */
-		host.route("GET", "/ping", (_req, res) => sendJson(res, 200, { ok: true, id: "bark-notify", configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null, mode: curMode(), hasKey: Boolean(cfgOf().barkKey), server: cfgOf().server || null, webBase: cfgOf().webBase || null, netAllowlist: [...ALLOWED_HOSTS, ...netGranted], permissions: ["net", "secrets", "storage", "ui", "http", "tools", "notify", "chat"], capabilities: caps, blocked: capsBlocked }));
+		host.route("GET", "/ping", (_req, res) => sendJson(res, 200, { ok: true, id: "bark-notify", configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null, mode: curMode(), hasKey: Boolean(cfgOf().barkKey), server: cfgOf().server || null, webBase: cfgOf().webBase || null, netAllowlist: [...ALLOWED_HOSTS, ...netGranted], levels: cfgOf().levels, permissions: ["net", "fs:read", "secrets", "storage", "ui", "http", "tools", "notify", "chat"], capabilities: caps, blocked: capsBlocked }));
 		host.route("GET", "/status", (_req, res) => sendJson(res, 200, { ok: true, mode: curMode(), recent, icon: cfgOf().icon || null, hasKey: Boolean(cfgOf().barkKey), configured: missingCfg().length === 0, missing: missingCfg(), allowlistHint: allowHint(cfgOf().server) || null }));
 		host.route("POST", "/test", async (req, res) => {
 			const contentType = String(req?.headers?.["content-type"] || "").split(";")[0].trim().toLowerCase();
 			if (contentType !== "application/json") return sendJson(res, 415, { ok: false, error: "application/json required" });
-			const out = await notify({ kind: "done", title: "Bark 推送测试", body: "配置测试通知", sound: "glass", level: "active", badge: 1 },
+			const out = await notify({ kind: "done", category: "service", title: "Bark 推送测试", body: "配置测试通知", sound: "glass", level: "active", badge: 1 },
 				{ force: true, bypassDedup: true, retryAuthorization: true });
 			const result = { ok: out.ok, ...(out.skipped ? { reason: out.skipped } : {}), ...(out.missing ? { missing: out.missing } : {}), ...(out.status ? { status: out.status } : {}) };
 			if (!out.ok && !out.skipped && !out.status) result.reason = "delivery-failed";
@@ -650,13 +727,13 @@ export default definePlugin({
 		const toolDef = {
 			name: "bark_notify",
 			label: "Bark 推送",
-			description: "给用户手机推一条 Bark 通知。适合：长任务完成、需要用户在手机上决策、跑挂了。level=critical 可穿透静音/专注模式。",
+			description: "给用户手机推一条 Bark 通知。适合：长任务完成、需要用户在手机上决策、跑挂了。level 可选普通/时效性/关键通知，默认 active；critical 在用户授权后可穿透静音/专注模式。",
 			parameters: {
 				type: "object",
 				properties: {
 					title: { type: "string", description: "锁屏第一行，建议带状态 emoji，≤40 字" },
 					body: { type: "string", description: "关键数字/下一步动作，可用 \\n 换行" },
-					level: { type: "string", enum: ["active", "timeSensitive", "critical"], description: "默认 active；critical 穿透静音" },
+					level: { type: "string", enum: ["active", "timeSensitive", "critical"], description: "默认 active 普通；timeSensitive 时效性；critical 关键通知/静音穿透（需系统授权）；quiet 优先" },
 					sound: { type: "string", description: "glass/cicada/crow/bell/silence 或外链 mp3 URL" },
 					group: { type: "string", description: "分组，如 pi / ci / home" },
 					quiet: { type: "boolean", description: "true = 静默归档，只记账不弹" },
@@ -669,11 +746,11 @@ export default definePlugin({
 				const raw = args.length >= 2 && args[1] && typeof args[1] === "object" ? args[1] : args[0];
 				const p = raw && typeof raw === "object" ? raw : {};
 				const out = await notify({
-					kind: p.level === "critical" ? "fail" : "done",
+					kind: "done",
 					title: clip(p.title || "🔔 推送", SHORT_TITLE),
 					body: clip(p.body || "", SHORT_BODY),
 					sound: p.quiet ? "silence" : p.sound || "glass",
-					level: p.level || "active",
+					level: normalizeLevel(p.level),
 					group: p.group || "pi",
 					archived: Boolean(p.quiet),
 					iconOverride: String(p.icon || "").trim() || undefined,
@@ -712,7 +789,7 @@ export default definePlugin({
 			if (Number.isFinite(bootAt) && Date.now() - bootAt <= 10 * 60 * 1000) return;
 			host.storage.set("boot:lastPing", Date.now());
 			notify({
-				kind: capsBlocked.length ? "ask" : "done",
+				kind: capsBlocked.length ? "ask" : "done", category: "service",
 				title: capsBlocked.length ? `⚠️ bark-notify 已加载（${capsBlocked.length} 项能力被拒）` : `🔌 bark-notify 已加载`,
 				body: capsBlocked.length
 					? `${capsBlocked.map(([ck, cv]) => `${ck}: ${cv}`).join("\n")}\n往 manifest.permissions 补上对应能力族再重装` 
